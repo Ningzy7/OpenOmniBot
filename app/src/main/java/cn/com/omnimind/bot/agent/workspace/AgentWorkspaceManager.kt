@@ -5,6 +5,7 @@ import android.net.Uri
 import cn.com.omnimind.baselib.i18n.AppLocaleManager
 import cn.com.omnimind.baselib.i18n.LocalizedText
 import cn.com.omnimind.baselib.i18n.PromptLocale
+import cn.com.omnimind.baselib.util.OmniLog
 import cn.com.omnimind.bot.workspace.PublicStorageAccess
 import java.io.File
 import java.nio.charset.Charset
@@ -480,6 +481,38 @@ class AgentWorkspaceManager(
     fun attachmentsDirectory(): File {
         ensureRuntimeDirectories()
         return attachmentsDir
+    }
+
+    /**
+     * 保存传入的附件到 attachments/ 目录。
+     *
+     * 修复 Bug：用户通过 file_picker 选择的文件停留在临时缓存位置
+     * （如 /cache/file_picker/），从未被复制到 .omnibot/attachments/。
+     * 该方法仅做纯粹的复制操作，权限由 App 进程 umask 自然决定。
+     *
+     * @param sourcePath 源文件路径（来自 attachment["path"]）
+     * @return 保存后的 File 对象，失败返回 null
+     */
+    fun saveIncomingAttachment(sourcePath: String): File? {
+        if (sourcePath.isBlank()) return null
+        val source = File(sourcePath)
+        if (!source.exists() || !source.isFile) return null
+
+        val targetName = "${System.currentTimeMillis()}_${source.name}"
+        val target = File(attachmentsDir, targetName)
+        return try {
+            target.parentFile?.mkdirs()
+            source.inputStream().use { input ->
+                target.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            OmniLog.i("AgentWorkspaceManager", "saveIncomingAttachment: ${source.name} -> ${target.absolutePath}")
+            target
+        } catch (e: Exception) {
+            OmniLog.w("AgentWorkspaceManager", "saveIncomingAttachment failed: ${e.message}")
+            null
+        }
     }
 
     fun sharedDirectory(): File {

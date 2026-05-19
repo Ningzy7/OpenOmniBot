@@ -90,6 +90,12 @@ internal object AgentImageAttachmentSupport {
         backend = RealBackend
     }
 
+    /**
+     * 外部注入的 workspaceManager，用于在处理附件时保存到 .omnibot/attachments/。
+     * 由 AgentRuntime 在初始化时注入。
+     */
+    internal var workspaceManagerProvider: (() -> AgentWorkspaceManager)? = null
+
     fun prepareAttachments(rawAttachments: List<Map<String, Any?>>): PreparedAttachments {
         if (rawAttachments.isEmpty()) {
             return PreparedAttachments(emptyList(), emptyList())
@@ -97,6 +103,8 @@ internal object AgentImageAttachmentSupport {
         val modelAttachments = mutableListOf<Map<String, Any?>>()
         val historyAttachments = mutableListOf<Map<String, Any?>>()
         rawAttachments.forEach { raw ->
+            // 先保存附件到 attachments/ 目录（修复 Bug 1）
+            saveAttachmentToWorkspace(raw)
             val prepared = prepareSingleAttachment(raw) ?: return@forEach
             if (shouldSendAttachmentToModel(raw)) {
                 modelAttachments += prepared.first
@@ -167,6 +175,26 @@ internal object AgentImageAttachmentSupport {
             payload = payload,
             imageDataUrl = compressed.dataUrl
         )
+    }
+
+    /**
+     * 将附件从临时路径保存到 .omnibot/attachments/ 目录。
+     * 修复 Bug：附件停留在 cache/file_picker/，未持久化到 workspace。
+     */
+    private fun saveAttachmentToWorkspace(attachment: Map<String, Any?>) {
+        val path = attachment["path"]?.toString()?.trim().orEmpty()
+        if (path.isBlank() || path.startsWith("http")) return
+        // 如果已经在 attachments/ 下则跳过
+        if (path.contains("/attachments/")) return
+
+        val provider = workspaceManagerProvider ?: return
+        val manager = provider()
+        val saved = manager.saveIncomingAttachment(path) ?: return
+        // 更新 path 为新位置，后续代码使用新路径
+        if (attachment is MutableMap) {
+            attachment["path"] = saved.absolutePath
+        }
+        OmniLog.i(TAG, "saveAttachmentToWorkspace: saved to ${saved.absolutePath}")
     }
 
     private fun prepareSingleAttachment(

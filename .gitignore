@@ -21,6 +21,7 @@ skills-lock.json
 
 release.jks
 *.jks
+!app/omnibot_release.jks
 *.keystore
 
 testbot/build
