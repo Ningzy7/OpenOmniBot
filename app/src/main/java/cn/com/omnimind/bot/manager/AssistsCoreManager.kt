@@ -3826,6 +3826,7 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
             call.argument<List<Map<String, Any?>>>("conversationHistory") ?: emptyList()
         val attachments = (call.argument<List<Map<String, Any?>>>("attachments") ?: emptyList())
             .map(::sanitizeInteropMap)
+        AgentImageAttachmentSupport.workspaceManagerProvider = { AgentWorkspaceManager(context) }
         val modelAttachments = AgentImageAttachmentSupport
             .prepareAttachments(attachments)
             .modelAttachments

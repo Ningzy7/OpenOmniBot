@@ -507,6 +507,11 @@ class AgentWorkspaceManager(
                     input.copyTo(output)
                 }
             }
+            // 确保 proot 环境（UID 10404）可读：目录 0755，文件 0644
+            target.setReadable(true, false)
+            target.setWritable(true, false)
+            target.parentFile?.setReadable(true, false)
+            target.parentFile?.setExecutable(true, false)
             OmniLog.i("AgentWorkspaceManager", "saveIncomingAttachment: ${source.name} -> ${target.absolutePath}")
             target
         } catch (e: Exception) {

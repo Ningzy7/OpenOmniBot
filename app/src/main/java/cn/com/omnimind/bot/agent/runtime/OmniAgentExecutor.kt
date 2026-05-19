@@ -64,6 +64,7 @@ class OmniAgentExecutor(
         return try {
             val agentRunId = UUID.randomUUID().toString()
             val workspaceManager = AgentWorkspaceManager(context)
+            AgentImageAttachmentSupport.workspaceManagerProvider = { workspaceManager }
             val memoryService = WorkspaceMemoryService(context, workspaceManager)
             val workspaceDescriptor = workspaceManager.buildWorkspaceDescriptor(
                 conversationId = conversationId,

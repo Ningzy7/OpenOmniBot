@@ -5,6 +5,7 @@ import cn.com.omnimind.baselib.database.DatabaseHelper
 import cn.com.omnimind.baselib.i18n.AppLocaleManager
 import cn.com.omnimind.baselib.util.OmniLog
 import cn.com.omnimind.bot.agent.AgentAiCapabilityConfigSync
+import cn.com.omnimind.bot.agent.AgentImageAttachmentSupport
 import cn.com.omnimind.bot.agent.AgentWorkspaceManager
 import cn.com.omnimind.bot.agent.SkillIndexService
 import cn.com.omnimind.bot.agent.WorkspaceMemoryRollupScheduler
@@ -122,6 +123,7 @@ class App : BaseApplication() {
             val workspaceManager = AgentWorkspaceManager(this)
             workspaceManager.ensureRuntimeDirectories()
             SkillIndexService(this, workspaceManager).seedBuiltinSkillsIfNeeded()
+            AgentImageAttachmentSupport.workspaceManagerProvider = { workspaceManager }
         }
         runCatching {
             AgentAiCapabilityConfigSync.get(this).initialize()
