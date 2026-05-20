@@ -55,13 +55,14 @@ class AgentOrchestrator(
     private var lastVlmCallMs = 0L
     /**
      * 检测 VLM 描述场景是否已配置（scene.vlm.description 优先，scene.vlm.operation.primary 兜底）。
+     * 仅认可用户手动绑定的场景（configSource == USER_OVERRIDE），内置默认绑定不生效。
      * 用户只需在 App 设置中绑定/解绑场景模型即可开关 VLM 翻译层。
      */
     private fun isVlmDescriptionSceneConfigured(): Boolean {
         val descProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.description")
-        if (descProfile != null && !descProfile.model.isNullOrBlank()) return true
+        if (descProfile != null && descProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE) return true
         val opProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.operation.primary")
-        return opProfile != null && !opProfile.model.isNullOrBlank()
+        return opProfile != null && opProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE
     }
 
     private fun t(zh: String, en: String): String {
@@ -416,14 +417,14 @@ class AgentOrchestrator(
      * 全部失败：向上抛异常，由调用方 fallback 到原始文本
      */
     private suspend fun describeImageViaVlm(imageDataUrl: String): String {
-        // 0. 动态解析场景：优先 scene.vlm.description，其次 scene.vlm.operation.primary
+        // 0. 动态解析场景：仅认可用户手动绑定的场景
         var sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.description")
         val sceneId: String
-        if (sceneProfile != null && !sceneProfile.model.isNullOrBlank()) {
+        if (sceneProfile != null && sceneProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE) {
             sceneId = "scene.vlm.description"
         } else {
             sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.operation.primary")
-            if (sceneProfile == null || sceneProfile.model.isNullOrBlank()) {
+            if (sceneProfile == null || sceneProfile.modelSource != ModelSceneRegistry.SceneSource.USER_OVERRIDE) {
                 throw IllegalStateException("VLM 描述场景未配置，请在设置中绑定 scene.vlm.description 或 scene.vlm.operation.primary")
             }
             sceneId = "scene.vlm.operation.primary"

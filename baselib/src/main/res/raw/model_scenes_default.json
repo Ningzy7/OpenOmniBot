@@ -40,7 +40,7 @@
     }
   },
   "scene.vlm.description": {
-    "model": "qwen3-vl-plus",
+    "model": "",
     "transport": "openai_compatible",
     "response_parser": "text_content",
     "description": "图片描述翻译层：将截图/图片用 VLM 描述后以纯文本注入消息流",
