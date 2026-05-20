@@ -1,12 +1,16 @@
 package cn.com.omnimind.bot.agent
 
+import cn.com.omnimind.assists.controller.http.HttpController
 import cn.com.omnimind.baselib.database.AgentConversationEntry
 import cn.com.omnimind.baselib.database.AgentConversationEntryRecord
 import cn.com.omnimind.baselib.llm.AssistantToolCall
 import cn.com.omnimind.baselib.llm.AssistantToolCallFunction
 import cn.com.omnimind.baselib.llm.ChatCompletionMessage
+import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -922,12 +926,25 @@ internal object AgentConversationHistorySupport {
             if (imageUrl.isBlank()) {
                 null
             } else {
+                val description = runBlocking(Dispatchers.IO) {
+                    try {
+                        val result = HttpController.postVLMDescriptionRequest(
+                            sceneId = "scene.vlm.operation.primary",
+                            payload = Payload.VLMChatPayload(
+                                model = "scene.vlm.operation.primary",
+                                images = listOf(imageUrl),
+                                text = "请详细描述这张图片的所有视觉内容、界面布局、控件和可见文字"
+                            )
+                        )
+                        result.message.ifBlank { "（VLM 返回空描述）" }
+                    } catch (e: Exception) {
+                        "[VLM 描述失败: ${e.message?.take(100) ?: "未知错误"}]"
+                    }
+                }
                 JsonObject(
                     mapOf(
-                        "type" to JsonPrimitive("image_url"),
-                        "image_url" to JsonObject(
-                            mapOf("url" to JsonPrimitive(imageUrl))
-                        )
+                        "type" to JsonPrimitive("text"),
+                        "text" to JsonPrimitive("[对话历史图片描述]: $description")
                     )
                 )
             }

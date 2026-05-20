@@ -1,10 +1,14 @@
 package cn.com.omnimind.bot.agent
 
 import android.content.Context
+import cn.com.omnimind.assists.controller.http.HttpController
 import cn.com.omnimind.baselib.i18n.AppLocaleManager
 import cn.com.omnimind.bot.mcp.RemoteMcpDiscoveryRegistry
+import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
@@ -222,11 +226,24 @@ class OmniAgentExecutor(
                 if (imageUrl.isBlank()) {
                     null
                 } else {
+                    val description = runBlocking(Dispatchers.IO) {
+                        try {
+                            val result = HttpController.postVLMDescriptionRequest(
+                                sceneId = "scene.vlm.operation.primary",
+                                payload = Payload.VLMChatPayload(
+                                    model = "scene.vlm.operation.primary",
+                                    images = listOf(imageUrl),
+                                    text = "请详细描述这张图片的所有视觉内容、界面布局、控件和可见文字"
+                                )
+                            )
+                            result.message.ifBlank { "（VLM 返回空描述）" }
+                        } catch (e: Exception) {
+                            "[VLM 描述失败: ${e.message?.take(100) ?: "未知错误"}]"
+                        }
+                    }
                     buildJsonObject {
-                        put("type", "image_url")
-                        put("image_url", buildJsonObject {
-                            put("url", imageUrl)
-                        })
+                        put("type", "text")
+                        put("text", "[用户上传图片描述]: $description")
                     }
                 }
             }
