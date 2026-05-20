@@ -2014,6 +2014,35 @@ object HttpController {
         return@withContext ResultBean(response.content.ifBlank { response.message })
     }
 
+    /**
+     * VLM 图片描述专用请求：强制使用 TEXT_CONTENT 解析器。
+     *
+     * 与 postVLMRequest 的核心区别：即使场景默认 response_parser 是
+     * openai_tool_actions（如 scene.vlm.operation.primary），也强制
+     * 以纯文本解析返回结果。避免 tool_actions 解析器遇到纯文本 VLM
+     * 响应时报 "unknown variant image_url" 反序列化异常。
+     */
+    suspend fun postVLMDescriptionRequest(
+        sceneId: String,
+        payload: Payload.VLMChatPayload
+    ): ResultBean = withContext(Dispatchers.IO) {
+        val resolved = resolveSceneRequest(
+            modelOrScene = sceneId,
+            defaultTransport = ModelSceneRegistry.SceneTransport.VLM_CHAT
+        )
+        // 强制覆盖为 TEXT_CONTENT，无视场景自带的 parser
+        val textResolved = resolved.copy(
+            responseParser = ModelSceneRegistry.ResponseParser.TEXT_CONTENT
+        )
+        logSceneProfile(textResolved)
+        val response = postSceneChatCompletionInternal(
+            resolved = textResolved,
+            request = createChatRequestFromVlmPayload(textResolved, payload),
+            retryOnBadRequest = false
+        )
+        return@withContext ResultBean(response.content.ifBlank { response.message })
+    }
+
     suspend fun postVLMStreamRequestAsFlow(
         model: String, text: String, image: String, event: EventSourceListener
 

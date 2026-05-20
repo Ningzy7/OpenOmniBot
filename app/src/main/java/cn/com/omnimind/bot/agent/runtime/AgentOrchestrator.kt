@@ -457,8 +457,9 @@ class AgentOrchestrator(
                 var description: String
                 val elapsed = measureTimeMillis {
                     val result = withTimeout(30_000) {
-                        HttpController.postVLMRequest(
-                            Payload.VLMChatPayload(
+                        HttpController.postVLMDescriptionRequest(
+                            sceneId = sceneId,
+                            payload = Payload.VLMChatPayload(
                                 model = sceneId,
                                 images = listOf(scaledDataUrl),
                                 text = "请详细描述这张图片的所有视觉内容、界面布局、控件和可见文字"
