@@ -7,9 +7,14 @@ import cn.com.omnimind.baselib.llm.ChatCompletionRequest
 import cn.com.omnimind.baselib.llm.ChatCompletionStreamOptions
 import cn.com.omnimind.baselib.llm.contentText
 import cn.com.omnimind.baselib.util.OmniLog
+import cn.com.omnimind.assists.controller.http.HttpController
+import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
+import kotlin.system.measureTimeMillis
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -43,6 +48,11 @@ class AgentOrchestrator(
     }
     private val tag = "AgentOrchestrator"
     private val maxLengthContinuationRounds = 3
+
+    // VLM 图像描述：缓存 + 限流
+    private val vlmDescriptionCache = LinkedHashMap<String, String>(16, 0.75f, true)
+    private var lastVlmCallMs = 0L
+    private var vlmEnabled = true
 
     private fun t(zh: String, en: String): String {
         return if (AppLocaleManager.isEnglish()) en else zh
@@ -380,7 +390,67 @@ class AgentOrchestrator(
         return finalResult
     }
 
-    private fun appendToolResultMessage(
+    /**
+     * 调用 VLM 模型（GLM-4.5V）描述图片内容。
+     * 含缓存、限流间隔、3 次自动重试。
+     * 全部失败则抛出异常，由调用方 fallback。
+     */
+    private suspend fun describeImageViaVlm(imageDataUrl: String): String {
+        // 1. 缓存命中
+        val cacheKey = imageDataUrl.hashCode().toString()
+        synchronized(vlmDescriptionCache) {
+            vlmDescriptionCache[cacheKey]?.let { return it }
+        }
+
+        // 2. 限流间隔 500ms
+        val sinceLast = System.currentTimeMillis() - lastVlmCallMs
+        if (sinceLast < 500) delay(500 - sinceLast)
+
+        // 3. 3 次重试 (0s → 2s → 4s backoff)
+        var lastError: Throwable? = null
+        repeat(3) { attempt ->
+            val backoff = when (attempt) {
+                0 -> 0L
+                1 -> 2_000L
+                else -> 4_000L
+            }
+            if (backoff > 0) delay(backoff)
+            try {
+                lastVlmCallMs = System.currentTimeMillis()
+                var description: String
+                val elapsed = measureTimeMillis {
+                    val result = withTimeout(25_000) {
+                        HttpController.postVLMRequest(
+                            Payload.VLMChatPayload(
+                                model = "scene.vlm.operation.primary",
+                                images = listOf(imageDataUrl),
+                                text = "请详细描述这张图片的所有视觉内容、界面布局、控件和可见文字"
+                            )
+                        )
+                    }
+                    description = result.message.ifBlank { "（VLM 返回空描述）" }
+                    synchronized(vlmDescriptionCache) {
+                        if (vlmDescriptionCache.size >= 32) {
+                            vlmDescriptionCache.remove(vlmDescriptionCache.keys.first())
+                        }
+                        vlmDescriptionCache[cacheKey] = description
+                    }
+                }
+                OmniLog.d(tag, "VLM 描述完成，耗时 ${elapsed}ms")
+                return description
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                lastError = e
+                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次超时")
+            } catch (e: Exception) {
+                lastError = e
+                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次失败: ${e.message}")
+            }
+        }
+        // 4. 全部失败，向上抛
+        throw lastError ?: IllegalStateException("VLM 描述全部失败")
+    }
+
+    private suspend fun appendToolResultMessage(
         messages: MutableList<ChatCompletionMessage>,
         toolCall: AssistantToolCall,
         descriptor: AgentToolRegistry.RuntimeToolDescriptor,
@@ -394,22 +464,22 @@ class AgentOrchestrator(
         )
         val imageDataUrl = (result as? ToolExecutionResult.ContextResult)?.imageDataUrl
 
-        val content: JsonElement = if (imageDataUrl != null) {
-            buildJsonArray {
-                add(buildJsonObject {
-                    put("type", "text")
-                    put("text", textContent)
-                })
-                add(buildJsonObject {
-                    put("type", "image_url")
-                    put("image_url", buildJsonObject {
-                        put("url", imageDataUrl)
-                    })
-                })
+        // ★ 核心：当工具返回截图时，用 VLM 描述图片内容，替换 image_url
+        val actualText = if (imageDataUrl != null && vlmEnabled) {
+            try {
+                val description = describeImageViaVlm(imageDataUrl)
+                "$textContent\n\n[VLM 图像描述]: $description"
+            } catch (e: Exception) {
+                OmniLog.w(tag, "VLM 描述全部失败，使用原始文本: ${e.message}")
+                // 失败时追加 fallback 提示，但不丢失工具的原始 textContent
+                "$textContent\n\n[VLM 描述失败: ${e.message}，以下为工具的原始文本输出]"
             }
         } else {
-            JsonPrimitive(textContent)
+            textContent
         }
+
+        // 无论 VLM 是否成功，都不再向主模型发送 image_url（DeepSeek 纯文本）
+        val content: JsonElement = JsonPrimitive(actualText)
 
         messages.add(
             ChatCompletionMessage(
