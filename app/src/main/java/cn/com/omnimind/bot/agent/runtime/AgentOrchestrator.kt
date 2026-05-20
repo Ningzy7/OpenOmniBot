@@ -5,6 +5,7 @@ import cn.com.omnimind.baselib.llm.AssistantToolCall
 import cn.com.omnimind.baselib.llm.ChatCompletionMessage
 import cn.com.omnimind.baselib.llm.ChatCompletionRequest
 import cn.com.omnimind.baselib.llm.ChatCompletionStreamOptions
+import cn.com.omnimind.baselib.llm.ModelSceneRegistry
 import cn.com.omnimind.baselib.llm.contentText
 import cn.com.omnimind.baselib.util.OmniLog
 import cn.com.omnimind.assists.controller.http.HttpController
@@ -52,7 +53,16 @@ class AgentOrchestrator(
     // VLM 图像描述：缓存 + 限流
     private val vlmDescriptionCache = LinkedHashMap<String, String>(16, 0.75f, true)
     private var lastVlmCallMs = 0L
-    private var vlmEnabled = true
+    /**
+     * 检测 VLM 描述场景是否已配置（scene.vlm.description 优先，scene.vlm.operation.primary 兜底）。
+     * 用户只需在 App 设置中绑定/解绑场景模型即可开关 VLM 翻译层。
+     */
+    private fun isVlmDescriptionSceneConfigured(): Boolean {
+        val descProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.description")
+        if (descProfile != null && !descProfile.model.isNullOrBlank()) return true
+        val opProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.operation.primary")
+        return opProfile != null && !opProfile.model.isNullOrBlank()
+    }
 
     private fun t(zh: String, en: String): String {
         return if (AppLocaleManager.isEnglish()) en else zh
@@ -391,11 +401,34 @@ class AgentOrchestrator(
     }
 
     /**
-     * 调用 VLM 模型（GLM-4.5V）描述图片内容。
-     * 含缓存、限流间隔、3 次自动重试。
-     * 全部失败则抛出异常，由调用方 fallback。
+     * 调用 VLM 模型描述图片内容。
+     *
+     * 场景读取逻辑：
+     *   1. 优先使用 scene.vlm.description 的运行时绑定
+     *   2. 若未绑定，退回到 scene.vlm.operation.primary
+     *   3. 若操作场景也未绑定，则返回 null（禁用）
+     *
+     * 图片缩放：max(宽,高) ≤ 1024px，JPEG quality=80
+     * 超时：30s
+     * 缓存：32 张哈希去重
+     * 限流：两次调用间隔 500ms
+     * 重试：3 次 (0s → 2s → 4s backoff)
+     * 全部失败：向上抛异常，由调用方 fallback 到原始文本
      */
     private suspend fun describeImageViaVlm(imageDataUrl: String): String {
+        // 0. 动态解析场景：优先 scene.vlm.description，其次 scene.vlm.operation.primary
+        var sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.description")
+        val sceneId: String
+        if (sceneProfile != null && !sceneProfile.model.isNullOrBlank()) {
+            sceneId = "scene.vlm.description"
+        } else {
+            sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.operation.primary")
+            if (sceneProfile == null || sceneProfile.model.isNullOrBlank()) {
+                throw IllegalStateException("VLM 描述场景未配置，请在设置中绑定 scene.vlm.description 或 scene.vlm.operation.primary")
+            }
+            sceneId = "scene.vlm.operation.primary"
+        }
+
         // 1. 缓存命中
         val cacheKey = imageDataUrl.hashCode().toString()
         synchronized(vlmDescriptionCache) {
@@ -406,7 +439,10 @@ class AgentOrchestrator(
         val sinceLast = System.currentTimeMillis() - lastVlmCallMs
         if (sinceLast < 500) delay(500 - sinceLast)
 
-        // 3. 3 次重试 (0s → 2s → 4s backoff)
+        // 3. 图片缩放：max(宽,高) ≤ 1024px
+        val scaledDataUrl = downscaleImageIfNeeded(imageDataUrl, maxDimension = 1024)
+
+        // 4. 3 次重试 (0s → 2s → 4s backoff)，超时 30s
         var lastError: Throwable? = null
         repeat(3) { attempt ->
             val backoff = when (attempt) {
@@ -419,11 +455,11 @@ class AgentOrchestrator(
                 lastVlmCallMs = System.currentTimeMillis()
                 var description: String
                 val elapsed = measureTimeMillis {
-                    val result = withTimeout(25_000) {
+                    val result = withTimeout(30_000) {
                         HttpController.postVLMRequest(
                             Payload.VLMChatPayload(
-                                model = "scene.vlm.operation.primary",
-                                images = listOf(imageDataUrl),
+                                model = sceneId,
+                                images = listOf(scaledDataUrl),
                                 text = "请详细描述这张图片的所有视觉内容、界面布局、控件和可见文字"
                             )
                         )
@@ -436,18 +472,59 @@ class AgentOrchestrator(
                         vlmDescriptionCache[cacheKey] = description
                     }
                 }
-                OmniLog.d(tag, "VLM 描述完成，耗时 ${elapsed}ms")
+                OmniLog.d(tag, "VLM 描述完成，场景=$sceneId，耗时 ${elapsed}ms")
                 return description
             } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
                 lastError = e
-                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次超时")
+                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次超时（场景=$sceneId）")
             } catch (e: Exception) {
                 lastError = e
-                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次失败: ${e.message}")
+                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次失败（场景=$sceneId）: ${e.message}")
             }
         }
-        // 4. 全部失败，向上抛
-        throw lastError ?: IllegalStateException("VLM 描述全部失败")
+        throw lastError ?: IllegalStateException("VLM 描述全部失败（场景=$sceneId）")
+    }
+
+    /**
+     * 将 base64 data URL 图片缩放到 maxDimension 以内，保持宽高比。
+     * 如果原图尺寸已经小于等于 maxDimension，不缩放。
+     * 返回新的 base64 data URL（JPEG quality=80）。
+     */
+    private fun downscaleImageIfNeeded(dataUrl: String, maxDimension: Int): String {
+        try {
+            // 提取 base64 数据
+            val commaIndex = dataUrl.indexOf(',')
+            if (commaIndex < 0) return dataUrl
+            val base64Data = dataUrl.substring(commaIndex + 1)
+            val imageBytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
+            val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+            if (bitmap == null) return dataUrl
+
+            val w = bitmap.width
+            val h = bitmap.height
+            val maxSide = maxOf(w, h)
+            if (maxSide <= maxDimension) {
+                bitmap.recycle()
+                return dataUrl // 不需要缩放
+            }
+
+            // 等比缩放
+            val scale = maxDimension.toFloat() / maxSide
+            val newW = (w * scale).toInt()
+            val newH = (h * scale).toInt()
+            val scaled = android.graphics.Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+            bitmap.recycle()
+
+            val output = java.io.ByteArrayOutputStream()
+            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, output)
+            scaled.recycle()
+
+            val encoded = android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP)
+            return "data:image/jpeg;base64,$encoded"
+        } catch (e: Exception) {
+            OmniLog.w(tag, "图片缩放失败，使用原图: ${e.message}")
+            return dataUrl
+        }
     }
 
     private suspend fun appendToolResultMessage(
@@ -465,7 +542,7 @@ class AgentOrchestrator(
         val imageDataUrl = (result as? ToolExecutionResult.ContextResult)?.imageDataUrl
 
         // ★ 核心：当工具返回截图时，用 VLM 描述图片内容，替换 image_url
-        val actualText = if (imageDataUrl != null && vlmEnabled) {
+        val actualText = if (imageDataUrl != null && isVlmDescriptionSceneConfigured()) {
             try {
                 val description = describeImageViaVlm(imageDataUrl)
                 "$textContent\n\n[VLM 图像描述]: $description"
