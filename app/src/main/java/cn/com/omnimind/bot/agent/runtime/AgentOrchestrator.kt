@@ -5,17 +5,15 @@ import cn.com.omnimind.baselib.llm.AssistantToolCall
 import cn.com.omnimind.baselib.llm.ChatCompletionMessage
 import cn.com.omnimind.baselib.llm.ChatCompletionRequest
 import cn.com.omnimind.baselib.llm.ChatCompletionStreamOptions
-import cn.com.omnimind.baselib.llm.ModelSceneRegistry
 import cn.com.omnimind.baselib.llm.contentText
 import cn.com.omnimind.baselib.util.OmniLog
 import cn.com.omnimind.assists.controller.http.HttpController
+import cn.com.omnimind.bot.agent.tool.AgentToolConcurrencyPolicy
 import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeout
-import kotlin.system.measureTimeMillis
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -49,21 +47,8 @@ class AgentOrchestrator(
     }
     private val tag = "AgentOrchestrator"
     private val maxLengthContinuationRounds = 3
-
-    // VLM 图像描述：缓存 + 限流
-    private val vlmDescriptionCache = LinkedHashMap<String, String>(16, 0.75f, true)
+    private val vlmDescriptionCache = mutableMapOf<String, String>()
     private var lastVlmCallMs = 0L
-    /**
-     * 检测 VLM 描述场景是否已配置（scene.vlm.description 优先，scene.vlm.operation.primary 兜底）。
-     * 仅认可用户手动绑定的场景（configSource == USER_OVERRIDE），内置默认绑定不生效。
-     * 用户只需在 App 设置中绑定/解绑场景模型即可开关 VLM 翻译层。
-     */
-    private fun isVlmDescriptionSceneConfigured(): Boolean {
-        val descProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.description")
-        if (descProfile != null && descProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE) return true
-        val opProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.operation.primary")
-        return opProfile != null && opProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE
-    }
 
     private fun t(zh: String, en: String): String {
         return if (AppLocaleManager.isEnglish()) en else zh
@@ -71,7 +56,7 @@ class AgentOrchestrator(
 
     suspend fun run(input: Input): AgentResult {
         val callback = input.callback
-        var messages = input.initialMessages.toMutableList()
+        val memory: AgentChatMemory = MutableListChatMemory(input.initialMessages)
         val executedTools = mutableListOf<ToolExecutionResult>()
         var outputKind = AgentOutputKind.NONE
         var hasUserFacingOutput = false
@@ -92,7 +77,7 @@ class AgentOrchestrator(
                 val round = completedModelRounds
                 val assistantContentPrefix = accumulatedAssistantContent
                 callback.onThinkingStart()
-                val toolChoiceForRound = if (messages.lastOrNull()?.role == "tool") {
+                val toolChoiceForRound = if (memory.lastRole() == "tool") {
                     null
                 } else {
                     JsonPrimitive("auto")
@@ -104,7 +89,7 @@ class AgentOrchestrator(
                 val disableThinking = input.executionEnv.reasoningEffort == "no"
                 val turn = llmClient.streamTurn(
                     request = ChatCompletionRequest(
-                        messages = messages.toList(),
+                        messages = memory.snapshot(),
                         model = model,
                         maxCompletionTokens = 16384,
                         stream = true,
@@ -113,7 +98,7 @@ class AgentOrchestrator(
                         reasoningEffort = if (disableThinking) null else input.executionEnv.reasoningEffort,
                         tools = toolRegistry.toolsForModel,
                         toolChoice = toolChoiceForRound,
-                        parallelToolCalls = false
+                        parallelToolCalls = true
                     ),
                     onReasoningUpdate = { reasoning ->
                         if (reasoning.isNotBlank()) {
@@ -149,7 +134,7 @@ class AgentOrchestrator(
                     "round=$round parsed_tool_calls=${toolCalls.size} finish_reason=${lastFinishReason.orEmpty()} assistant_content_len=${lastAssistantContent.length}"
                 )
 
-                messages.add(
+                memory.add(
                     ChatCompletionMessage(
                         role = "assistant",
                         content = normalizeAssistantContentForNextRound(
@@ -171,14 +156,15 @@ class AgentOrchestrator(
                     )
                 }
                 input.contextCompactor?.let { compactor ->
-                    messages = compactor.compactIfNeeded(
+                    val compacted = compactor.compactIfNeeded(
                         conversationId = input.conversationId,
                         conversationMode = input.executionEnv.conversationMode,
                         promptTokens = latestPromptTokens,
-                        messages = messages,
+                        messages = memory.snapshot(),
                         promptTokenThresholdOverride = latestPromptTokenThreshold,
                         callback = callback
-                    ).toMutableList()
+                    )
+                    memory.replaceAll(compacted)
                 }
 
                 if (toolCalls.isEmpty()) {
@@ -189,7 +175,7 @@ class AgentOrchestrator(
                     ) {
                         lengthContinuationRounds += 1
                         accumulatedAssistantContent = lastAssistantContent
-                        messages.add(buildLengthContinuationMessage())
+                        memory.add(buildLengthContinuationMessage())
                         logInfo(
                             tag,
                             "round=$round finish_reason=${lastFinishReason.orEmpty()} auto_continue=$lengthContinuationRounds/${maxLengthContinuationRounds} accumulated_content_len=${accumulatedAssistantContent.length}"
@@ -215,8 +201,17 @@ class AgentOrchestrator(
                 lengthContinuationRounds = 0
 
                 var advanceToNextRound = false
-                for (toolCall in toolCalls) {
+                val descriptorMap = mutableMapOf<String, AgentToolRegistry.RuntimeToolDescriptor>()
+                val parsedArgsMap = mutableMapOf<String, JsonObject>()
+                val validatedCalls = mutableListOf<AssistantToolCall>()
+
+                // Phase A — parse + validate all tool arguments synchronously.
+                // Any parse/validation failure aborts the current turn's tool execution
+                // (matching pre-refactor semantics: write the error tool message,
+                // skip remaining calls, and advance to the next LLM round).
+                parsePhase@ for (toolCall in toolCalls) {
                     val descriptor = toolRegistry.runtimeDescriptor(toolCall.function.name)
+                    descriptorMap[toolCall.id] = descriptor
                     val parsedArgs: JsonObject = try {
                         parseToolArguments(toolCall.function.arguments)
                     } catch (error: Exception) {
@@ -234,7 +229,7 @@ class AgentOrchestrator(
                         executedTools.add(result)
                         callback.onToolCallComplete(toolCall.function.name, result)
                         appendToolResultMessage(
-                            messages = messages,
+                            memory = memory,
                             toolCall = toolCall,
                             descriptor = descriptor,
                             result = result,
@@ -243,9 +238,8 @@ class AgentOrchestrator(
                         hasUserFacingOutput =
                             hasUserFacingOutput || eventAdapter.hasUserVisibleOutput(result)
                         advanceToNextRound = true
-                        break
+                        break@parsePhase
                     }
-
                     val validationError = runCatching {
                         toolRegistry.validateArguments(toolCall.function.name, parsedArgs)
                     }.exceptionOrNull()
@@ -264,7 +258,7 @@ class AgentOrchestrator(
                         executedTools.add(result)
                         callback.onToolCallComplete(toolCall.function.name, result)
                         appendToolResultMessage(
-                            messages = messages,
+                            memory = memory,
                             toolCall = toolCall,
                             descriptor = descriptor,
                             result = result,
@@ -273,80 +267,116 @@ class AgentOrchestrator(
                         hasUserFacingOutput =
                             hasUserFacingOutput || eventAdapter.hasUserVisibleOutput(result)
                         advanceToNextRound = true
-                        break
+                        break@parsePhase
                     }
+                    parsedArgsMap[toolCall.id] = parsedArgs
+                    validatedCalls.add(toolCall)
+                }
 
-                    val toolHandle = input.executionEnv.runControl.beginToolExecution(
-                        toolName = toolCall.function.name,
-                        toolCallId = toolCall.id
+                // Phase B — partition validated calls into batches and execute.
+                if (validatedCalls.isNotEmpty()) {
+                    val batches = AgentToolConcurrencyPolicy.partitionToolCalls(
+                        validatedCalls,
+                        parsedArgsMap
                     )
-                    callback.onToolCallStart(toolCall.function.name, parsedArgs)
-                    val result = try {
-                        coroutineScope {
-                            val deferred = async {
-                                toolRouter.execute(
-                                    toolCall = toolCall,
-                                    args = parsedArgs,
-                                    runtimeDescriptor = descriptor,
+                    logInfo(
+                        tag,
+                        "round=$round batches=${batches.size} " +
+                            batches.joinToString(separator = ",") { batch ->
+                                "${if (batch.parallel) "P" else "S"}${batch.calls.size}"
+                            }
+                    )
+
+                    batchLoop@ for (batch in batches) {
+                        val batchResults: List<Pair<AssistantToolCall, ToolExecutionResult>>
+                        if (batch.parallel && batch.calls.size > 1) {
+                            // Parallel batch: launch async per call. callback.onToolCallStart /
+                            // onToolCallComplete fire from inside each async (lets UI update each
+                            // card independently). State mutation + memory append happen serially
+                            // below to preserve ToolCall ↔ ToolMessage pairing order.
+                            batchResults = coroutineScope {
+                                batch.calls.map { call ->
+                                    async {
+                                        val desc = descriptorMap.getValue(call.id)
+                                        val args = parsedArgsMap.getValue(call.id)
+                                        val result = executeSingleTool(
+                                            env = input.executionEnv,
+                                            callback = callback,
+                                            toolCall = call,
+                                            descriptor = desc,
+                                            parsedArgs = args
+                                        )
+                                        callback.onToolCallComplete(call.function.name, result)
+                                        call to result
+                                    }
+                                }.awaitAll()
+                            }
+                        } else {
+                            // Serial batch (single call or barrier).
+                            val singles = mutableListOf<Pair<AssistantToolCall, ToolExecutionResult>>()
+                            for (call in batch.calls) {
+                                val desc = descriptorMap.getValue(call.id)
+                                val args = parsedArgsMap.getValue(call.id)
+                                val result = executeSingleTool(
                                     env = input.executionEnv,
                                     callback = callback,
-                                    toolHandle = toolHandle
+                                    toolCall = call,
+                                    descriptor = desc,
+                                    parsedArgs = args
                                 )
+                                callback.onToolCallComplete(call.function.name, result)
+                                singles.add(call to result)
                             }
-                            toolHandle.bindExecutionJob(deferred)
-                            deferred.await()
+                            batchResults = singles
                         }
-                    } catch (error: CancellationException) {
-                        if (toolHandle.isManualStopRequested()) {
-                            buildInterruptedToolResult(
-                                toolName = toolCall.function.name,
-                                toolHandle = toolHandle
+
+                        var breakBatchLoopAfterPost = false
+                        // Phase C — serial post-process: write results back to memory in
+                        // original call order, accumulate UI state, honor stop conditions.
+                        for ((call, result) in batchResults) {
+                            val desc = descriptorMap.getValue(call.id)
+                            val args = parsedArgsMap.getValue(call.id)
+                            executedTools.add(result)
+                            val failureLearning = buildFailureLearningPayload(
+                                env = input.executionEnv,
+                                toolCall = call,
+                                descriptor = desc,
+                                argumentsJson = args.toString(),
+                                result = result
                             )
-                        } else {
-                            throw error
+                            appendToolResultMessage(
+                                memory = memory,
+                                toolCall = call,
+                                descriptor = desc,
+                                result = result,
+                                failureLearning = failureLearning
+                            )
+
+                            if (eventAdapter.hasUserVisibleOutput(result)) {
+                                hasUserFacingOutput = true
+                            }
+                            val mappedKind = eventAdapter.mapOutputKind(result)
+                            if (mappedKind != AgentOutputKind.NONE) {
+                                outputKind = mappedKind
+                            }
+                            if (eventAdapter.isConversationStoppingResult(result)) {
+                                terminated = true
+                                break@roundLoop
+                            }
+                            if (
+                                call.function.name == "terminal_execute" ||
+                                call.function.name == "android_privileged_action" ||
+                                call.function.name == "android_privileged_session_start" ||
+                                call.function.name == "android_privileged_session_exec" ||
+                                call.function.name == "android_privileged_session_read" ||
+                                call.function.name == "android_privileged_session_stop"
+                            ) {
+                                breakBatchLoopAfterPost = true
+                            }
                         }
-                    } finally {
-                        toolHandle.complete()
-                    }
-
-                    executedTools.add(result)
-                    val failureLearning = buildFailureLearningPayload(
-                        env = input.executionEnv,
-                        toolCall = toolCall,
-                        descriptor = descriptor,
-                        argumentsJson = parsedArgs.toString(),
-                        result = result
-                    )
-                    callback.onToolCallComplete(toolCall.function.name, result)
-                    appendToolResultMessage(
-                        messages = messages,
-                        toolCall = toolCall,
-                        descriptor = descriptor,
-                        result = result,
-                        failureLearning = failureLearning
-                    )
-
-                    if (eventAdapter.hasUserVisibleOutput(result)) {
-                        hasUserFacingOutput = true
-                    }
-                    val mappedKind = eventAdapter.mapOutputKind(result)
-                    if (mappedKind != AgentOutputKind.NONE) {
-                        outputKind = mappedKind
-                    }
-
-                    if (eventAdapter.isConversationStoppingResult(result)) {
-                        terminated = true
-                        break@roundLoop
-                    }
-                    if (
-                        toolCall.function.name == "terminal_execute" ||
-                        toolCall.function.name == "android_privileged_action" ||
-                        toolCall.function.name == "android_privileged_session_start" ||
-                        toolCall.function.name == "android_privileged_session_exec" ||
-                        toolCall.function.name == "android_privileged_session_read" ||
-                        toolCall.function.name == "android_privileged_session_stop"
-                    ) {
-                        break
+                        if (breakBatchLoopAfterPost) {
+                            break@batchLoop
+                        }
                     }
                 }
 
@@ -401,136 +431,49 @@ class AgentOrchestrator(
         return finalResult
     }
 
-    /**
-     * 调用 VLM 模型描述图片内容。
-     *
-     * 场景读取逻辑：
-     *   1. 优先使用 scene.vlm.description 的运行时绑定
-     *   2. 若未绑定，退回到 scene.vlm.operation.primary
-     *   3. 若操作场景也未绑定，则返回 null（禁用）
-     *
-     * 图片缩放：max(宽,高) ≤ 1024px，JPEG quality=80
-     * 超时：30s
-     * 缓存：32 张哈希去重
-     * 限流：两次调用间隔 500ms
-     * 重试：3 次 (0s → 2s → 4s backoff)
-     * 全部失败：向上抛异常，由调用方 fallback 到原始文本
-     */
-    private suspend fun describeImageViaVlm(imageDataUrl: String): String {
-        // 0. 动态解析场景：仅认可用户手动绑定的场景
-        var sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.description")
-        val sceneId: String
-        if (sceneProfile != null && sceneProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE) {
-            sceneId = "scene.vlm.description"
-        } else {
-            sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.operation.primary")
-            if (sceneProfile == null || sceneProfile.modelSource != ModelSceneRegistry.SceneSource.USER_OVERRIDE) {
-                throw IllegalStateException("VLM 描述场景未配置，请在设置中绑定 scene.vlm.description 或 scene.vlm.operation.primary")
-            }
-            sceneId = "scene.vlm.operation.primary"
-        }
-
-        // 1. 缓存命中
-        val cacheKey = imageDataUrl.hashCode().toString()
-        synchronized(vlmDescriptionCache) {
-            vlmDescriptionCache[cacheKey]?.let { return it }
-        }
-
-        // 2. 限流间隔 500ms
-        val sinceLast = System.currentTimeMillis() - lastVlmCallMs
-        if (sinceLast < 500) delay(500 - sinceLast)
-
-        // 3. 图片缩放：max(宽,高) ≤ 1024px
-        val scaledDataUrl = downscaleImageIfNeeded(imageDataUrl, maxDimension = 1024)
-
-        // 4. 3 次重试 (0s → 2s → 4s backoff)，超时 30s
-        var lastError: Throwable? = null
-        repeat(3) { attempt ->
-            val backoff = when (attempt) {
-                0 -> 0L
-                1 -> 2_000L
-                else -> 4_000L
-            }
-            if (backoff > 0) delay(backoff)
-            try {
-                lastVlmCallMs = System.currentTimeMillis()
-                var description: String
-                val elapsed = measureTimeMillis {
-                    val result = withTimeout(30_000) {
-                        HttpController.postVLMDescriptionRequest(
-                            sceneId = sceneId,
-                            payload = Payload.VLMChatPayload(
-                                model = sceneId,
-                                images = listOf(scaledDataUrl),
-                                text = "请详细描述这张图片的所有视觉内容、界面布局、控件和可见文字"
-                            )
-                        )
-                    }
-                    description = result.message.ifBlank { "（VLM 返回空描述）" }
-                    synchronized(vlmDescriptionCache) {
-                        if (vlmDescriptionCache.size >= 32) {
-                            vlmDescriptionCache.remove(vlmDescriptionCache.keys.first())
-                        }
-                        vlmDescriptionCache[cacheKey] = description
-                    }
+    private suspend fun executeSingleTool(
+        env: AgentExecutionEnvironment,
+        callback: AgentCallback,
+        toolCall: AssistantToolCall,
+        descriptor: AgentToolRegistry.RuntimeToolDescriptor,
+        parsedArgs: JsonObject
+    ): ToolExecutionResult {
+        val toolHandle = env.runControl.beginToolExecution(
+            toolName = toolCall.function.name,
+            toolCallId = toolCall.id
+        )
+        callback.onToolCallStart(toolCall.function.name, parsedArgs)
+        return try {
+            coroutineScope {
+                val deferred = async {
+                    toolRouter.execute(
+                        toolCall = toolCall,
+                        args = parsedArgs,
+                        runtimeDescriptor = descriptor,
+                        env = env,
+                        callback = callback,
+                        toolHandle = toolHandle
+                    )
                 }
-                OmniLog.d(tag, "VLM 描述完成，场景=$sceneId，耗时 ${elapsed}ms")
-                return description
-            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-                lastError = e
-                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次超时（场景=$sceneId）")
-            } catch (e: Exception) {
-                lastError = e
-                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次失败（场景=$sceneId）: ${e.message}")
+                toolHandle.bindExecutionJob(deferred)
+                deferred.await()
             }
-        }
-        throw lastError ?: IllegalStateException("VLM 描述全部失败（场景=$sceneId）")
-    }
-
-    /**
-     * 将 base64 data URL 图片缩放到 maxDimension 以内，保持宽高比。
-     * 如果原图尺寸已经小于等于 maxDimension，不缩放。
-     * 返回新的 base64 data URL（JPEG quality=80）。
-     */
-    private fun downscaleImageIfNeeded(dataUrl: String, maxDimension: Int): String {
-        try {
-            // 提取 base64 数据
-            val commaIndex = dataUrl.indexOf(',')
-            if (commaIndex < 0) return dataUrl
-            val base64Data = dataUrl.substring(commaIndex + 1)
-            val imageBytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
-            val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-            if (bitmap == null) return dataUrl
-
-            val w = bitmap.width
-            val h = bitmap.height
-            val maxSide = maxOf(w, h)
-            if (maxSide <= maxDimension) {
-                bitmap.recycle()
-                return dataUrl // 不需要缩放
+        } catch (error: CancellationException) {
+            if (toolHandle.isManualStopRequested()) {
+                buildInterruptedToolResult(
+                    toolName = toolCall.function.name,
+                    toolHandle = toolHandle
+                )
+            } else {
+                throw error
             }
-
-            // 等比缩放
-            val scale = maxDimension.toFloat() / maxSide
-            val newW = (w * scale).toInt()
-            val newH = (h * scale).toInt()
-            val scaled = android.graphics.Bitmap.createScaledBitmap(bitmap, newW, newH, true)
-            bitmap.recycle()
-
-            val output = java.io.ByteArrayOutputStream()
-            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, output)
-            scaled.recycle()
-
-            val encoded = android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP)
-            return "data:image/jpeg;base64,$encoded"
-        } catch (e: Exception) {
-            OmniLog.w(tag, "图片缩放失败，使用原图: ${e.message}")
-            return dataUrl
+        } finally {
+            toolHandle.complete()
         }
     }
 
-    private suspend fun appendToolResultMessage(
-        messages: MutableList<ChatCompletionMessage>,
+    private fun appendToolResultMessage(
+        memory: AgentChatMemory,
         toolCall: AssistantToolCall,
         descriptor: AgentToolRegistry.RuntimeToolDescriptor,
         result: ToolExecutionResult,
@@ -543,24 +486,37 @@ class AgentOrchestrator(
         )
         val imageDataUrl = (result as? ToolExecutionResult.ContextResult)?.imageDataUrl
 
-        // ★ 核心：当工具返回截图时，用 VLM 描述图片内容，替换 image_url
+        // ★ 核心：当工具返回截图且 VLM 描述场景已配置时，用 VLM 描述图片内容替代 image_url
         val actualText = if (imageDataUrl != null && isVlmDescriptionSceneConfigured()) {
             try {
                 val description = describeImageViaVlm(imageDataUrl)
                 "$textContent\n\n[VLM 图像描述]: $description"
             } catch (e: Exception) {
                 OmniLog.w(tag, "VLM 描述全部失败，使用原始文本: ${e.message}")
-                // 失败时追加 fallback 提示，但不丢失工具的原始 textContent
-                "$textContent\n\n[VLM 描述失败: ${e.message}，以下为工具的原始文本输出]"
+                "$textContent\n\n[VLM 描述失败: ${e.message}]"
+            }
+        } else null
+
+        val content: JsonElement = if (actualText != null) {
+            JsonPrimitive(actualText)
+        } else if (imageDataUrl != null) {
+            buildJsonArray {
+                add(buildJsonObject {
+                    put("type", "text")
+                    put("text", textContent)
+                })
+                add(buildJsonObject {
+                    put("type", "image_url")
+                    put("image_url", buildJsonObject {
+                        put("url", imageDataUrl)
+                    })
+                })
             }
         } else {
-            textContent
+            JsonPrimitive(textContent)
         }
 
-        // 无论 VLM 是否成功，都不再向主模型发送 image_url（DeepSeek 纯文本）
-        val content: JsonElement = JsonPrimitive(actualText)
-
-        messages.add(
+        memory.add(
             ChatCompletionMessage(
                 role = "tool",
                 toolCallId = toolCall.id,
@@ -736,4 +692,126 @@ class AgentOrchestrator(
     private fun logInfo(tag: String, message: String) {
         runCatching { OmniLog.i(tag, message) }
     }
+
+    // ===== VLM 图像描述（来自 fork 的改动） =====
+
+    private fun isVlmDescriptionSceneConfigured(): Boolean {
+        var sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.description")
+        if (sceneProfile != null && sceneProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE) {
+            return true
+        }
+        sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.operation.primary")
+        return sceneProfile != null && sceneProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE
+    }
+
+    /**
+     * 调用 VLM 模型描述图片内容。
+     * 图片缩放：max(宽,高) ≤ 1024px，JPEG quality=80
+     * 超时：30s，缓存 32 张，限流 500ms，重试 3 次
+     */
+    private suspend fun describeImageViaVlm(imageDataUrl: String): String {
+        var sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.description")
+        val sceneId: String
+        if (sceneProfile != null && sceneProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE) {
+            sceneId = "scene.vlm.description"
+        } else {
+            sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.operation.primary")
+            if (sceneProfile == null || sceneProfile.modelSource != ModelSceneRegistry.SceneSource.USER_OVERRIDE) {
+                throw IllegalStateException("VLM 描述场景未配置")
+            }
+            sceneId = "scene.vlm.operation.primary"
+        }
+
+        val cacheKey = imageDataUrl.hashCode().toString()
+        synchronized(vlmDescriptionCache) {
+            vlmDescriptionCache[cacheKey]?.let { return it }
+        }
+
+        val sinceLast = System.currentTimeMillis() - lastVlmCallMs
+        if (sinceLast < 500) delay(500 - sinceLast)
+
+        val scaledDataUrl = downscaleImageIfNeeded(imageDataUrl, maxDimension = 1024)
+
+        var lastError: Throwable? = null
+        repeat(3) { attempt ->
+            val backoff = when (attempt) {
+                0 -> 0L
+                1 -> 2_000L
+                else -> 4_000L
+            }
+            if (backoff > 0) delay(backoff)
+            try {
+                lastVlmCallMs = System.currentTimeMillis()
+                var description: String
+                val elapsed = measureTimeMillis {
+                    val result = withTimeout(30_000) {
+                        HttpController.postVLMDescriptionRequest(
+                            sceneId = sceneId,
+                            payload = Payload.VLMChatPayload(
+                                model = sceneId,
+                                images = listOf(scaledDataUrl),
+                                text = "请详细描述这张图片的所有视觉内容、界面布局、控件和可见文字"
+                            )
+                        )
+                    }
+                    description = result.message.ifBlank { "（VLM 返回空描述）" }
+                    synchronized(vlmDescriptionCache) {
+                        if (vlmDescriptionCache.size >= 32) {
+                            vlmDescriptionCache.remove(vlmDescriptionCache.keys.first())
+                        }
+                        vlmDescriptionCache[cacheKey] = description
+                    }
+                }
+                OmniLog.d(tag, "VLM 描述完成，场景=$sceneId，耗时 ${elapsed}ms")
+                return description
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                lastError = e
+                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次超时（场景=$sceneId）")
+            } catch (e: Exception) {
+                lastError = e
+                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次失败（场景=$sceneId）: ${e.message}")
+            }
+        }
+        throw lastError ?: IllegalStateException("VLM 描述全部失败（场景=$sceneId）")
+    }
+
+    /**
+     * 将 base64 data URL 图片缩放到 maxDimension 以内，保持宽高比。
+     * 返回新的 base64 data URL（JPEG quality=80）。
+     */
+    private fun downscaleImageIfNeeded(dataUrl: String, maxDimension: Int): String {
+        try {
+            val commaIndex = dataUrl.indexOf(',')
+            if (commaIndex < 0) return dataUrl
+            val base64Data = dataUrl.substring(commaIndex + 1)
+            val imageBytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
+            val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+            if (bitmap == null) return dataUrl
+
+            val w = bitmap.width
+            val h = bitmap.height
+            val maxSide = maxOf(w, h)
+            if (maxSide <= maxDimension) {
+                bitmap.recycle()
+                return dataUrl
+            }
+
+            val scale = maxDimension.toFloat() / maxSide
+            val newW = (w * scale).toInt()
+            val newH = (h * scale).toInt()
+            val scaled = android.graphics.Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+            bitmap.recycle()
+
+            val output = java.io.ByteArrayOutputStream()
+            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, output)
+            scaled.recycle()
+
+            val encoded = android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP)
+            return "data:image/jpeg;base64,$encoded"
+        } catch (e: Exception) {
+            OmniLog.w(tag, "图片缩放失败，使用原图: ${e.message}")
+            return dataUrl
+        }
+    }
+
 }
