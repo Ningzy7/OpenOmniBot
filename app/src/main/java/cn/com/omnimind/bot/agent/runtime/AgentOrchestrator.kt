@@ -475,7 +475,7 @@ class AgentOrchestrator(
         }
     }
 
-    private fun appendToolResultMessage(
+    private suspend fun appendToolResultMessage(
         memory: AgentChatMemory,
         toolCall: AssistantToolCall,
         descriptor: AgentToolRegistry.RuntimeToolDescriptor,
@@ -696,35 +696,14 @@ class AgentOrchestrator(
         runCatching { OmniLog.i(tag, message) }
     }
 
-    // ===== VLM 图像描述（来自 fork 的改动） =====
 
-    private fun isVlmDescriptionSceneConfigured(): Boolean {
-        var sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.description")
-        if (sceneProfile != null && sceneProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE) {
-            return true
-        }
-        sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.operation.primary")
-        return sceneProfile != null && sceneProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE
-    }
+    // ===== VLM 图像描述 — 硬编码 scene.vlm.operation.primary，不依赖场景配置 =====
 
     /**
-     * 调用 VLM 模型描述图片内容。
-     * 图片缩放：max(宽,高) ≤ 1024px，JPEG quality=80
-     * 超时：30s，缓存 32 张，限流 500ms，重试 3 次
+     * 调用 scene.vlm.operation.primary 描述图片内容返回文本。
+     * 缩放 max(w,h)<=1024, JPEG quality=80, 缓存 32 张, 限流 500ms, 重试 3 次
      */
     private suspend fun describeImageViaVlm(imageDataUrl: String): String {
-        var sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.description")
-        val sceneId: String
-        if (sceneProfile != null && sceneProfile.modelSource == ModelSceneRegistry.SceneSource.USER_OVERRIDE) {
-            sceneId = "scene.vlm.description"
-        } else {
-            sceneProfile = ModelSceneRegistry.getRuntimeProfile("scene.vlm.operation.primary")
-            if (sceneProfile == null || sceneProfile.modelSource != ModelSceneRegistry.SceneSource.USER_OVERRIDE) {
-                throw IllegalStateException("VLM 描述场景未配置")
-            }
-            sceneId = "scene.vlm.operation.primary"
-        }
-
         val cacheKey = imageDataUrl.hashCode().toString()
         synchronized(vlmDescriptionCache) {
             vlmDescriptionCache[cacheKey]?.let { return it }
@@ -737,21 +716,16 @@ class AgentOrchestrator(
 
         var lastError: Throwable? = null
         repeat(3) { attempt ->
-            val backoff = when (attempt) {
-                0 -> 0L
-                1 -> 2_000L
-                else -> 4_000L
-            }
-            if (backoff > 0) delay(backoff)
+            if (attempt > 0) delay(when(attempt) { 1 -> 2_000L else -> 4_000L })
             try {
                 lastVlmCallMs = System.currentTimeMillis()
-                var vlmResult: String = ""
+                var vlmResult = ""
                 val elapsed = measureTimeMillis {
                     val result = withTimeout(30_000) {
                         HttpController.postVLMDescriptionRequest(
-                            sceneId = sceneId,
+                            sceneId = "scene.vlm.operation.primary",
                             payload = Payload.VLMChatPayload(
-                                model = sceneId,
+                                model = "scene.vlm.operation.primary",
                                 images = listOf(scaledDataUrl),
                                 text = "请详细描述这张图片的所有视觉内容、界面布局、控件和可见文字"
                             )
@@ -765,22 +739,21 @@ class AgentOrchestrator(
                         vlmDescriptionCache[cacheKey] = vlmResult
                     }
                 }
-                OmniLog.d(tag, "VLM 描述完成，场景=$sceneId，耗时 ${elapsed}ms")
+                OmniLog.d(tag, "VLM 描述完成，场景=scene.vlm.operation.primary，耗时 ${elapsed}ms")
                 return vlmResult
             } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
                 lastError = e
-                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次超时（场景=$sceneId）")
+                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次超时")
             } catch (e: Exception) {
                 lastError = e
-                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次失败（场景=$sceneId）: ${e.message}")
+                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次失败: ${e.message}")
             }
         }
-        throw lastError ?: IllegalStateException("VLM 描述全部失败（场景=$sceneId）")
+        throw lastError ?: IllegalStateException("VLM 描述全部失败")
     }
 
     /**
-     * 将 base64 data URL 图片缩放到 maxDimension 以内，保持宽高比。
-     * 返回新的 base64 data URL（JPEG quality=80）。
+     * 将 base64 data URL 缩放到 maxDimension 以内，保持宽高比。JPEG quality=80。
      */
     private fun downscaleImageIfNeeded(dataUrl: String, maxDimension: Int): String {
         try {
@@ -791,17 +764,12 @@ class AgentOrchestrator(
             val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
             if (bitmap == null) return dataUrl
 
-            val w = bitmap.width
-            val h = bitmap.height
-            val maxSide = maxOf(w, h)
-            if (maxSide <= maxDimension) {
-                bitmap.recycle()
-                return dataUrl
-            }
+            val maxSide = maxOf(bitmap.width, bitmap.height)
+            if (maxSide <= maxDimension) { bitmap.recycle(); return dataUrl }
 
             val scale = maxDimension.toFloat() / maxSide
-            val newW = (w * scale).toInt()
-            val newH = (h * scale).toInt()
+            val newW = (bitmap.width * scale).toInt()
+            val newH = (bitmap.height * scale).toInt()
             val scaled = android.graphics.Bitmap.createScaledBitmap(bitmap, newW, newH, true)
             bitmap.recycle()
 
@@ -816,5 +784,6 @@ class AgentOrchestrator(
             return dataUrl
         }
     }
+
 
 }
