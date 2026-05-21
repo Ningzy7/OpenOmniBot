@@ -7,17 +7,11 @@ import cn.com.omnimind.baselib.llm.ChatCompletionRequest
 import cn.com.omnimind.baselib.llm.ChatCompletionStreamOptions
 import cn.com.omnimind.baselib.llm.contentText
 import cn.com.omnimind.baselib.util.OmniLog
-import cn.com.omnimind.assists.controller.http.HttpController
 import cn.com.omnimind.bot.agent.tool.AgentToolConcurrencyPolicy
-import cn.com.omnimind.baselib.llm.ModelSceneRegistry
-import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeout
-import kotlin.system.measureTimeMillis
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -51,8 +45,6 @@ class AgentOrchestrator(
     }
     private val tag = "AgentOrchestrator"
     private val maxLengthContinuationRounds = 3
-    private val vlmDescriptionCache = mutableMapOf<String, String>()
-    private var lastVlmCallMs = 0L
 
     private fun t(zh: String, en: String): String {
         return if (AppLocaleManager.isEnglish()) en else zh
@@ -476,7 +468,7 @@ class AgentOrchestrator(
         }
     }
 
-    private suspend fun appendToolResultMessage(
+    private fun appendToolResultMessage(
         memory: AgentChatMemory,
         toolCall: AssistantToolCall,
         descriptor: AgentToolRegistry.RuntimeToolDescriptor,
@@ -490,20 +482,7 @@ class AgentOrchestrator(
         )
         val imageDataUrl = (result as? ToolExecutionResult.ContextResult)?.imageDataUrl
 
-        // ★ 核心：当工具返回截图且 VLM 描述场景已配置时，用 VLM 描述图片内容替代 image_url
-        val actualText = if (imageDataUrl != null && isVlmDescriptionSceneConfigured()) {
-            try {
-                val description = describeImageViaVlm(imageDataUrl)
-                "$textContent\n\n[VLM 图像描述]: $description"
-            } catch (e: Exception) {
-                OmniLog.w(tag, "VLM 描述全部失败，使用原始文本: ${e.message}")
-                "$textContent\n\n[VLM 描述失败: ${e.message}]"
-            }
-        } else null
-
-        val content: JsonElement = if (actualText != null) {
-            JsonPrimitive(actualText)
-        } else if (imageDataUrl != null) {
+        val content: JsonElement = if (imageDataUrl != null) {
             buildJsonArray {
                 add(buildJsonObject {
                     put("type", "text")
