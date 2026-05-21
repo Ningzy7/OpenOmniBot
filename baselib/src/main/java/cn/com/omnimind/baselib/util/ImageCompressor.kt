@@ -33,7 +33,7 @@ enum class ImageQuality(
     /**
      * 中等质量 - 默认 VLM 操作（点击/滑动/输入）
      */
-    MEDIUM(0.5f, 100, ImageCompressor.RESIZE_BYPASS_PIXEL_THRESHOLD),
+    MEDIUM(0.5f, 85, ImageCompressor.RESIZE_BYPASS_PIXEL_THRESHOLD),
 
     /**
      * 低质量 - 快速传输或多图场景
