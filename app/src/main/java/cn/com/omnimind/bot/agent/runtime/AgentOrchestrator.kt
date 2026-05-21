@@ -9,11 +9,15 @@ import cn.com.omnimind.baselib.llm.contentText
 import cn.com.omnimind.baselib.util.OmniLog
 import cn.com.omnimind.assists.controller.http.HttpController
 import cn.com.omnimind.bot.agent.tool.AgentToolConcurrencyPolicy
+import cn.com.omnimind.baselib.llm.ModelSceneRegistry
 import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
+import kotlin.system.measureTimeMillis
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -472,7 +476,7 @@ class AgentOrchestrator(
         }
     }
 
-    private fun appendToolResultMessage(
+    private suspend fun appendToolResultMessage(
         memory: AgentChatMemory,
         toolCall: AssistantToolCall,
         descriptor: AgentToolRegistry.RuntimeToolDescriptor,
@@ -742,7 +746,7 @@ class AgentOrchestrator(
             if (backoff > 0) delay(backoff)
             try {
                 lastVlmCallMs = System.currentTimeMillis()
-                var description: String
+                var vlmResult: String = ""
                 val elapsed = measureTimeMillis {
                     val result = withTimeout(30_000) {
                         HttpController.postVLMDescriptionRequest(
@@ -754,16 +758,16 @@ class AgentOrchestrator(
                             )
                         )
                     }
-                    description = result.message.ifBlank { "（VLM 返回空描述）" }
+                    vlmResult = result.message.ifBlank { "（VLM 返回空描述）" }
                     synchronized(vlmDescriptionCache) {
                         if (vlmDescriptionCache.size >= 32) {
                             vlmDescriptionCache.remove(vlmDescriptionCache.keys.first())
                         }
-                        vlmDescriptionCache[cacheKey] = description
+                        vlmDescriptionCache[cacheKey] = vlmResult
                     }
                 }
                 OmniLog.d(tag, "VLM 描述完成，场景=$sceneId，耗时 ${elapsed}ms")
-                return description
+                return vlmResult
             } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
                 lastError = e
                 OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次超时（场景=$sceneId）")
