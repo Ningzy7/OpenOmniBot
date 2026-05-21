@@ -21,6 +21,11 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import cn.com.omnimind.assists.controller.http.HttpController
+import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
+import kotlin.system.measureTimeMillis
 
 class AgentOrchestrator(
     private val llmClient: AgentLlmClient,
@@ -45,6 +50,8 @@ class AgentOrchestrator(
     }
     private val tag = "AgentOrchestrator"
     private val maxLengthContinuationRounds = 3
+    private val vlmDescriptionCache = mutableMapOf<String, String>()
+    private var lastVlmCallMs = 0L
 
     private fun t(zh: String, en: String): String {
         return if (AppLocaleManager.isEnglish()) en else zh
@@ -482,7 +489,20 @@ class AgentOrchestrator(
         )
         val imageDataUrl = (result as? ToolExecutionResult.ContextResult)?.imageDataUrl
 
-        val content: JsonElement = if (imageDataUrl != null) {
+        // ★ 有截图时用 VLM (scene.vlm.operation.primary) 描述图片返回文本，避免纯文本模型 400
+        val finalText = if (imageDataUrl != null) {
+            try {
+                val description = describeImageViaVlm(imageDataUrl)
+                "$textContent\n\n[VLM 图像描述]: $description"
+            } catch (e: Exception) {
+                OmniLog.w(tag, "VLM 描述失败，退而发送 image_url: ${e.message}")
+                null
+            }
+        } else null
+
+        val content: JsonElement = if (finalText != null) {
+            JsonPrimitive(finalText)
+        } else if (imageDataUrl != null) {
             buildJsonArray {
                 add(buildJsonObject {
                     put("type", "text")
