@@ -9,6 +9,8 @@ import cn.com.omnimind.bot.agent.AgentImageAttachmentSupport
 import cn.com.omnimind.bot.agent.AgentWorkspaceManager
 import cn.com.omnimind.bot.agent.SkillIndexService
 import cn.com.omnimind.bot.agent.WorkspaceMemoryRollupScheduler
+import com.service.framework.Fw
+import com.service.framework.core.AggressiveLevel
 import cn.com.omnimind.bot.agent.WorkspaceScheduledTaskScheduler
 import cn.com.omnimind.bot.activity.StartupThemeResolver
 import cn.com.omnimind.bot.localmodel.LocalModelFeatureInstaller
@@ -136,6 +138,20 @@ class App : BaseApplication() {
         }
         runCatching {
             ShizukuCapabilityManager.get(this)
+        }
+
+        // Fw 保活 — KeepLiveService (Pangu-Immortal)
+        Fw.init(this) {
+            aggressiveLevel = AggressiveLevel.LOW
+            enableForegroundService = true
+            enableMediaSessionNotification = true
+            enableDualProcess = true
+            enableTileService = true
+            enableWidget = true
+            enableSilentAudio = false
+            enableNativeDaemon = false
+            enableVpnService = false
+            enableForceStopResistance = false
         }
 
         initSDKsAfterPrivacyConsent()

@@ -50,6 +50,7 @@ navigationFragment = "2.8.9"
 navigationUi = "2.8.9"
 palette = "1.0.0"
 shizuku = "13.1.5"
+keeplive = "1.11.56"
 [libraries]
 accompanist-systemuicontroller = { module = "com.google.accompanist:accompanist-systemuicontroller", version.ref = "accompanistSystemuicontroller" }
 anrwatchdog = { module = "com.github.anrwatchdog:anrwatchdog", version.ref = "anrwatchdog" }
@@ -59,6 +60,7 @@ androidx-documentfile = { group = "androidx.documentfile", name = "documentfile"
 androidx-material-icons-core = { group = "androidx.compose.material", name = "material-icons-core" }
 androidx-palette = { module = "androidx.palette:palette", version.ref = "palette" }
 shizuku-api = { module = "dev.rikka.shizuku:api", version.ref = "shizuku" }
+keeplive-framework = { module = "io.github.pangu-immortal:keeplive-framework", version.ref = "keeplive" }
 shizuku-provider = { module = "dev.rikka.shizuku:provider", version.ref = "shizuku" }
 androidx-lifecycle-livedata-ktx = { module = "androidx.lifecycle:lifecycle-livedata-ktx", version.ref = "lifecycleLivedataKtx" }
 androidx-room-paging = { module = "androidx.room:room-paging", version.ref = "roomPaging" }

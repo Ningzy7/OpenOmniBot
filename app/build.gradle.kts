@@ -233,6 +233,7 @@ dependencies {
     implementation(libs.androidx.security.crypto)
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.shizuku.provider)
+    implementation(libs.keeplive.framework)
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.cio)
     implementation(libs.ktor.server.auth)
