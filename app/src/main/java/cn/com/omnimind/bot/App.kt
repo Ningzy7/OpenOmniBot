@@ -140,17 +140,14 @@ class App : BaseApplication() {
             ShizukuCapabilityManager.get(this)
         }
 
-        // Fw 保活 — KeepLiveService (Pangu-Immortal)
+        // Fw 保活 — KeepLiveService (Pangu-Immortal) v1.11.56
         Fw.init(this) {
             aggressiveLevel = AggressiveLevel.LOW
             enableForegroundService = true
-            enableMediaSessionNotification = true
+            enableMediaSession = true
             enableDualProcess = true
-            enableTileService = true
-            enableWidget = true
             enableSilentAudio = false
             enableNativeDaemon = false
-            enableVpnService = false
             enableForceStopResistance = false
         }
 
