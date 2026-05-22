@@ -7,8 +7,11 @@ import cn.com.omnimind.assists.controller.http.HttpController
 import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 internal object AgentImageAttachmentSupport {
     private const val TAG = "AgentImageAttachmentSupport"
@@ -508,7 +511,19 @@ internal object AgentImageAttachmentSupport {
      * 缩放 max(w,h)<=1024, JPEG quality=80, 缓存 32 张, 限流 500ms, 重试 3 次
      */
     internal suspend fun describeImageViaVlm(imageDataUrl: String): String {
-        val cacheKey = imageDataUrl.hashCode().toString()
+        // ★ 远程 URL 需要先下载转 base64
+        val dataUrlForVlm = if (imageDataUrl.startsWith("http://") || imageDataUrl.startsWith("https://")) {
+            try {
+                downloadImageAsDataUrl(imageDataUrl)
+            } catch (e: Exception) {
+                OmniLog.w(TAG, "远程图片下载失败: ${e.message}")
+                throw e
+            }
+        } else {
+            imageDataUrl
+        }
+
+        val cacheKey = dataUrlForVlm.hashCode().toString()
         synchronized(vlmDescriptionCache) {
             vlmDescriptionCache[cacheKey]?.let { return it }
         }
@@ -516,7 +531,7 @@ internal object AgentImageAttachmentSupport {
         val sinceLast = System.currentTimeMillis() - lastVlmCallMs
         if (sinceLast < 500) delay(500 - sinceLast)
 
-        val scaledDataUrl = downscaleImageIfNeeded(imageDataUrl, maxDimension = 1024)
+        val scaledDataUrl = downscaleImageIfNeeded(dataUrlForVlm, maxDimension = 1024)
 
         var lastError: Throwable? = null
         repeat(3) { attempt ->
@@ -550,5 +565,44 @@ internal object AgentImageAttachmentSupport {
             }
         }
         throw lastError ?: IllegalStateException("VLM 描述全部失败")
+    }
+
+    /** 下载远程图片并转为 base64 data URL */
+    private suspend fun downloadImageAsDataUrl(url: String): String {
+        return withTimeout(30_000) {
+            val client = okhttp3.OkHttpClient.Builder()
+                .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+            val request = okhttp3.Request.Builder().url(url).build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw Exception("HTTP ${response.code}")
+                }
+                val body = response.body ?: throw Exception("empty body")
+                val bytes = body.bytes()
+                // 从 URL 或 Content-Type 推断 MIME
+                val mimeType = run {
+                    val ct = response.header("Content-Type")?.lowercase(Locale.ROOT)
+                    when {
+                        ct?.contains("png") == true -> "image/png"
+                        ct?.contains("gif") == true -> "image/gif"
+                        ct?.contains("webp") == true -> "image/webp"
+                        ct?.contains("heic") == true || ct?.contains("heif") == true -> "image/heic"
+                        else -> {
+                            val lower = url.lowercase(Locale.ROOT)
+                            when {
+                                lower.contains(".png") -> "image/png"
+                                lower.contains(".gif") -> "image/gif"
+                                lower.contains(".webp") -> "image/webp"
+                                else -> "image/jpeg"
+                            }
+                        }
+                    }
+                }
+                val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                "data:$mimeType;base64,$base64"
+            }
+        }
     }
 }
