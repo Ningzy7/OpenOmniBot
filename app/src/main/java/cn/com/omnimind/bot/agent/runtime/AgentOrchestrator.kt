@@ -21,11 +21,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import cn.com.omnimind.assists.controller.http.HttpController
-import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeout
-import kotlin.system.measureTimeMillis
+
 
 class AgentOrchestrator(
     private val llmClient: AgentLlmClient,
@@ -50,8 +46,6 @@ class AgentOrchestrator(
     }
     private val tag = "AgentOrchestrator"
     private val maxLengthContinuationRounds = 3
-    private val vlmDescriptionCache = mutableMapOf<String, String>()
-    private var lastVlmCallMs = 0L
 
     private fun t(zh: String, en: String): String {
         return if (AppLocaleManager.isEnglish()) en else zh
@@ -492,7 +486,7 @@ class AgentOrchestrator(
         // ★ 有截图时用 VLM (scene.vlm.operation.primary) 描述图片返回文本，避免纯文本模型 400
         val finalText = if (imageDataUrl != null) {
             try {
-                val description = describeImageViaVlm(imageDataUrl)
+                val description = AgentImageAttachmentSupport.describeImageViaVlm(imageDataUrl)
                 "$textContent\n\n[VLM 图像描述]: $description"
             } catch (e: Exception) {
                 OmniLog.w(tag, "VLM 描述失败，退而发送 image_url: ${e.message}")
@@ -697,93 +691,7 @@ class AgentOrchestrator(
     }
 
 
-    // ===== VLM 图像描述 — 硬编码 scene.vlm.operation.primary，不依赖场景配置 =====
-
-    /**
-     * 调用 scene.vlm.operation.primary 描述图片内容返回文本。
-     * 缩放 max(w,h)<=1024, JPEG quality=80, 缓存 32 张, 限流 500ms, 重试 3 次
-     */
-    private suspend fun describeImageViaVlm(imageDataUrl: String): String {
-        val cacheKey = imageDataUrl.hashCode().toString()
-        synchronized(vlmDescriptionCache) {
-            vlmDescriptionCache[cacheKey]?.let { return it }
-        }
-
-        val sinceLast = System.currentTimeMillis() - lastVlmCallMs
-        if (sinceLast < 500) delay(500 - sinceLast)
-
-        val scaledDataUrl = downscaleImageIfNeeded(imageDataUrl, maxDimension = 1024)
-
-        var lastError: Throwable? = null
-        repeat(3) { attempt ->
-            if (attempt > 0) delay(when(attempt) { 1 -> 2_000L else -> 4_000L })
-            try {
-                lastVlmCallMs = System.currentTimeMillis()
-                var vlmResult = ""
-                val elapsed = measureTimeMillis {
-                    val result = withTimeout(30_000) {
-                        HttpController.postVLMDescriptionRequest(
-                            sceneId = "scene.vlm.operation.primary",
-                            payload = Payload.VLMChatPayload(
-                                model = "scene.vlm.operation.primary",
-                                images = listOf(scaledDataUrl),
-                                text = "请详细描述这张图片的所有视觉内容、界面布局、控件和可见文字"
-                            )
-                        )
-                    }
-                    vlmResult = result.message.ifBlank { "（VLM 返回空描述）" }
-                    synchronized(vlmDescriptionCache) {
-                        if (vlmDescriptionCache.size >= 32) {
-                            vlmDescriptionCache.remove(vlmDescriptionCache.keys.first())
-                        }
-                        vlmDescriptionCache[cacheKey] = vlmResult
-                    }
-                }
-                OmniLog.d(tag, "VLM 描述完成，场景=scene.vlm.operation.primary，耗时 ${elapsed}ms")
-                return vlmResult
-            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-                lastError = e
-                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次超时")
-            } catch (e: Exception) {
-                lastError = e
-                OmniLog.w(tag, "VLM 描述第 ${attempt + 1} 次失败: ${e.message}")
-            }
-        }
-        throw lastError ?: IllegalStateException("VLM 描述全部失败")
-    }
-
-    /**
-     * 将 base64 data URL 缩放到 maxDimension 以内，保持宽高比。JPEG quality=80。
-     */
-    private fun downscaleImageIfNeeded(dataUrl: String, maxDimension: Int): String {
-        try {
-            val commaIndex = dataUrl.indexOf(',')
-            if (commaIndex < 0) return dataUrl
-            val base64Data = dataUrl.substring(commaIndex + 1)
-            val imageBytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
-            val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-            if (bitmap == null) return dataUrl
-
-            val maxSide = maxOf(bitmap.width, bitmap.height)
-            if (maxSide <= maxDimension) { bitmap.recycle(); return dataUrl }
-
-            val scale = maxDimension.toFloat() / maxSide
-            val newW = (bitmap.width * scale).toInt()
-            val newH = (bitmap.height * scale).toInt()
-            val scaled = android.graphics.Bitmap.createScaledBitmap(bitmap, newW, newH, true)
-            bitmap.recycle()
-
-            val output = java.io.ByteArrayOutputStream()
-            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, output)
-            scaled.recycle()
-
-            val encoded = android.util.Base64.encodeToString(output.toByteArray(), android.util.Base64.NO_WRAP)
-            return "data:image/jpeg;base64,$encoded"
-        } catch (e: Exception) {
-            OmniLog.w(tag, "图片缩放失败，使用原图: ${e.message}")
-            return dataUrl
-        }
-    }
+    // ===== VLM 图像描述 — 委托至 AgentImageAttachmentSupport 共享方法 =====
 
 
 }

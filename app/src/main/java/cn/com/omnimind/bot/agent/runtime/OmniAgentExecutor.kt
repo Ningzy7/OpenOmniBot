@@ -2,6 +2,7 @@ package cn.com.omnimind.bot.agent
 
 import android.content.Context
 import cn.com.omnimind.baselib.i18n.AppLocaleManager
+import cn.com.omnimind.baselib.util.OmniLog
 import cn.com.omnimind.bot.agent.workspace.memory.LongTermMemoryIndex
 import cn.com.omnimind.bot.agent.workspace.memory.MemoryRetrievalPipeline
 import cn.com.omnimind.bot.agent.workspace.memory.TurnMemoryLoadTracker
@@ -11,6 +12,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
@@ -45,6 +47,7 @@ class OmniAgentExecutor(
         }
     }
 
+    private val tag = "OmniAgentExecutor"
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -217,7 +220,7 @@ class OmniAgentExecutor(
         }
     }
 
-    private fun buildInitialMessages(
+    private suspend fun buildInitialMessages(
         promptSeed: AgentConversationHistoryRepository.PromptSeed,
         userMessage: String,
         attachments: List<Map<String, Any?>>,
@@ -309,36 +312,51 @@ class OmniAgentExecutor(
         )
     }
 
-    private fun buildCurrentUserMessage(
+    private suspend fun buildCurrentUserMessage(
         userMessage: String,
         attachments: List<Map<String, Any?>>
     ): cn.com.omnimind.baselib.llm.ChatCompletionMessage {
         val normalizedAttachments = normalizeAttachments(attachments)
-        val imageParts = normalizedAttachments
-            .filter { it.isImage }
-            .mapNotNull { attachment ->
-                val imageUrl = resolveImageAttachmentUrl(attachment)
-                if (imageUrl.isBlank()) {
-                    null
-                } else {
+        val imageParts = mutableListOf<JsonObject>()
+        val vlmDescriptions = mutableListOf<String>()
+
+        // ★ 用户上传图片时先用 VLM 描述，避免纯文本模型 400
+        for (attachment in normalizedAttachments.filter { it.isImage }) {
+            val imageUrl = resolveImageAttachmentUrl(attachment)
+            if (imageUrl.isBlank()) continue
+            try {
+                val description = AgentImageAttachmentSupport.describeImageViaVlm(imageUrl)
+                vlmDescriptions.add(description)
+            } catch (e: Exception) {
+                OmniLog.w(tag, "VLM 描述失败，退而发送 image_url: ${e.message}")
+                imageParts.add(
                     buildJsonObject {
                         put("type", "image_url")
                         put("image_url", buildJsonObject {
                             put("url", imageUrl)
                         })
                     }
-                }
+                )
             }
-        val rawText = userMessage
-        val content = if (imageParts.isEmpty()) {
-            JsonPrimitive(rawText)
+        }
+
+        val descriptionText = if (vlmDescriptions.isNotEmpty()) {
+            vlmDescriptions.joinToString("\n---\n") { "[用户上传图片描述]: $it" }
+        } else ""
+
+        val combinedText = if (descriptionText.isNotBlank()) {
+            if (userMessage.isNotBlank()) "$userMessage\n\n$descriptionText" else descriptionText
+        } else userMessage
+
+        val content: JsonElement = if (imageParts.isEmpty()) {
+            JsonPrimitive(combinedText)
         } else {
             buildJsonArray {
-                if (rawText.isNotBlank()) {
+                if (combinedText.isNotBlank()) {
                     add(
                         buildJsonObject {
                             put("type", "text")
-                            put("text", rawText)
+                            put("text", combinedText)
                         }
                     )
                 }

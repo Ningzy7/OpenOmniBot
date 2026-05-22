@@ -3,6 +3,10 @@ package cn.com.omnimind.bot.agent
 import android.util.Base64
 import cn.com.omnimind.baselib.util.ImageCompressor
 import cn.com.omnimind.baselib.util.OmniLog
+import cn.com.omnimind.assists.controller.http.HttpController
+import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.util.Locale
 
@@ -461,5 +465,90 @@ internal object AgentImageAttachmentSupport {
         }
         val mimeType = header.removePrefix("data:").substringBefore(';').trim()
         return if (mimeType.isBlank()) "image/jpeg" else mimeType
+    }
+
+    // ===== VLM 图像描述 — 共享方法（两端复用） =====
+
+    private val vlmDescriptionCache = mutableMapOf<String, String>()
+    private var lastVlmCallMs = 0L
+
+    /** 缩放 base64 data URL 到 maxDimension 以内，保持宽高比。JPEG quality=80。 */
+    internal fun downscaleImageIfNeeded(dataUrl: String, maxDimension: Int): String {
+        try {
+            val commaIndex = dataUrl.indexOf(',')
+            if (commaIndex < 0) return dataUrl
+            val base64Data = dataUrl.substring(commaIndex + 1)
+            val imageBytes = Base64.decode(base64Data, Base64.DEFAULT)
+            val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+            if (bitmap == null) return dataUrl
+
+            val maxSide = maxOf(bitmap.width, bitmap.height)
+            if (maxSide <= maxDimension) { bitmap.recycle(); return dataUrl }
+
+            val scale = maxDimension.toFloat() / maxSide
+            val newW = (bitmap.width * scale).toInt()
+            val newH = (bitmap.height * scale).toInt()
+            val scaled = android.graphics.Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+            bitmap.recycle()
+
+            val output = java.io.ByteArrayOutputStream()
+            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, output)
+            scaled.recycle()
+
+            val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+            return "data:image/jpeg;base64,$encoded"
+        } catch (e: Exception) {
+            OmniLog.w(TAG, "图片缩放失败，使用原图: ${e.message}")
+            return dataUrl
+        }
+    }
+
+    /**
+     * 调用 scene.vlm.operation.primary 描述图片内容返回文本。
+     * 缩放 max(w,h)<=1024, JPEG quality=80, 缓存 32 张, 限流 500ms, 重试 3 次
+     */
+    internal suspend fun describeImageViaVlm(imageDataUrl: String): String {
+        val cacheKey = imageDataUrl.hashCode().toString()
+        synchronized(vlmDescriptionCache) {
+            vlmDescriptionCache[cacheKey]?.let { return it }
+        }
+
+        val sinceLast = System.currentTimeMillis() - lastVlmCallMs
+        if (sinceLast < 500) delay(500 - sinceLast)
+
+        val scaledDataUrl = downscaleImageIfNeeded(imageDataUrl, maxDimension = 1024)
+
+        var lastError: Throwable? = null
+        repeat(3) { attempt ->
+            if (attempt > 0) delay(when(attempt) { 1 -> 2_000L else -> 4_000L })
+            try {
+                lastVlmCallMs = System.currentTimeMillis()
+                val result = withTimeout(30_000) {
+                    HttpController.postVLMDescriptionRequest(
+                        sceneId = "scene.vlm.operation.primary",
+                        payload = Payload.VLMChatPayload(
+                            model = "scene.vlm.operation.primary",
+                            images = listOf(scaledDataUrl),
+                            text = "请详细描述这张图片的所有视觉内容、界面布局、控件和可见文字"
+                        )
+                    )
+                }
+                val vlmResult = result.message.ifBlank { "（VLM 返回空描述）" }
+                synchronized(vlmDescriptionCache) {
+                    if (vlmDescriptionCache.size >= 32) {
+                        vlmDescriptionCache.remove(vlmDescriptionCache.keys.first())
+                    }
+                    vlmDescriptionCache[cacheKey] = vlmResult
+                }
+                return vlmResult
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                lastError = e
+                OmniLog.w(TAG, "VLM 描述第 ${attempt + 1} 次超时")
+            } catch (e: Exception) {
+                lastError = e
+                OmniLog.w(TAG, "VLM 描述第 ${attempt + 1} 次失败: ${e.message}")
+            }
+        }
+        throw lastError ?: IllegalStateException("VLM 描述全部失败")
     }
 }
