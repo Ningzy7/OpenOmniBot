@@ -328,15 +328,8 @@ class OmniAgentExecutor(
                 val description = AgentImageAttachmentSupport.describeImageViaVlm(imageUrl)
                 vlmDescriptions.add(description)
             } catch (e: Exception) {
-                OmniLog.w(tag, "VLM 描述失败，退而发送 image_url: ${e.message}")
-                imageParts.add(
-                    buildJsonObject {
-                        put("type", "image_url")
-                        put("image_url", buildJsonObject {
-                            put("url", imageUrl)
-                        })
-                    }
-                )
+                OmniLog.w(tag, "VLM 描述失败，跳过图片: ${e.message}")
+                // ★ 不降级发送 image_url（纯文本模型不支持），仅跳过
             }
         }
 

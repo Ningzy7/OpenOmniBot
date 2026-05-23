@@ -7,6 +7,7 @@ import cn.com.omnimind.assists.controller.http.HttpController
 import cn.com.omnimind.omniintelligence.models.AgentRequest.Payload
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
+import kotlin.math.ceil
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
@@ -475,27 +476,61 @@ internal object AgentImageAttachmentSupport {
     private val vlmDescriptionCache = mutableMapOf<String, String>()
     private var lastVlmCallMs = 0L
 
-    /** 缩放 base64 data URL 到 maxDimension 以内，保持宽高比。JPEG quality=80。 */
+    /** 缩放 base64 data URL 到 maxDimension 以内，保持宽高比。采样解码避免大图 OOM。JPEG quality=70。 */
     internal fun downscaleImageIfNeeded(dataUrl: String, maxDimension: Int): String {
         try {
             val commaIndex = dataUrl.indexOf(',')
             if (commaIndex < 0) return dataUrl
             val base64Data = dataUrl.substring(commaIndex + 1)
             val imageBytes = Base64.decode(base64Data, Base64.DEFAULT)
-            val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-            if (bitmap == null) return dataUrl
 
-            val maxSide = maxOf(bitmap.width, bitmap.height)
-            if (maxSide <= maxDimension) { bitmap.recycle(); return dataUrl }
+            // ★ 先采样获取尺寸，避免全尺寸解码 OOM
+            val opts = android.graphics.BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, opts)
+            val origW = opts.outWidth
+            val origH = opts.outHeight
+            if (origW <= 0 || origH <= 0) return dataUrl
 
-            val scale = maxDimension.toFloat() / maxSide
-            val newW = (bitmap.width * scale).toInt()
-            val newH = (bitmap.height * scale).toInt()
-            val scaled = android.graphics.Bitmap.createScaledBitmap(bitmap, newW, newH, true)
-            bitmap.recycle()
+            val maxSide = maxOf(origW, origH)
+            if (maxSide <= maxDimension) {
+                // 已经够小，直接解码（小图不会 OOM）
+                val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+                if (bitmap == null) return dataUrl
+                val output = java.io.ByteArrayOutputStream()
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, output)
+                bitmap.recycle()
+                val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+                return "data:image/jpeg;base64,$encoded"
+            }
+
+            // ★ 计算 inSampleSize：目标是让采样后短边 ~maxDimension
+            val sampleSize = ceil(maxSide.toDouble() / maxDimension).toInt().coerceAtLeast(2)
+            val sampleOpts = android.graphics.BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+            }
+            val sampled = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, sampleOpts)
+            if (sampled == null) return dataUrl
+
+            // ★ 从采样结果再精确缩放到 maxDimension
+            val sampledMaxSide = maxOf(sampled.width, sampled.height)
+            if (sampledMaxSide <= maxDimension) {
+                val output = java.io.ByteArrayOutputStream()
+                sampled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, output)
+                sampled.recycle()
+                val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+                return "data:image/jpeg;base64,$encoded"
+            }
+
+            val scale = maxDimension.toFloat() / sampledMaxSide
+            val newW = (sampled.width * scale).toInt()
+            val newH = (sampled.height * scale).toInt()
+            val scaled = android.graphics.Bitmap.createScaledBitmap(sampled, newW, newH, true)
+            sampled.recycle()
 
             val output = java.io.ByteArrayOutputStream()
-            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, output)
+            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, output)
             scaled.recycle()
 
             val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
@@ -508,7 +543,7 @@ internal object AgentImageAttachmentSupport {
 
     /**
      * 调用 scene.vlm.operation.primary 描述图片内容返回文本。
-     * 缩放 max(w,h)<=1024, JPEG quality=80, 缓存 32 张, 限流 500ms, 重试 3 次
+     * 缩放 max(w,h)<=768, JPEG quality=70, 采样解码防大图 OOM, 缓存 32 张, 限流 500ms, 重试 3 次
      */
     internal suspend fun describeImageViaVlm(imageDataUrl: String): String {
         // ★ 远程 URL 需要先下载转 base64
@@ -531,7 +566,7 @@ internal object AgentImageAttachmentSupport {
         val sinceLast = System.currentTimeMillis() - lastVlmCallMs
         if (sinceLast < 500) delay(500 - sinceLast)
 
-        val scaledDataUrl = downscaleImageIfNeeded(dataUrlForVlm, maxDimension = 1024)
+        val scaledDataUrl = downscaleImageIfNeeded(dataUrlForVlm, maxDimension = 768)
 
         var lastError: Throwable? = null
         repeat(3) { attempt ->
