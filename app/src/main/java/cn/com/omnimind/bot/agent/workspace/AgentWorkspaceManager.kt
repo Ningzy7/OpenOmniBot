@@ -366,6 +366,9 @@ class AgentWorkspaceManager(
             if (!directory.exists()) {
                 directory.mkdirs()
             }
+            // ★ Proot Alpine 以不同 UID 运行，需要目录可遍历(r-x)，文件可读(r--)，否则附件读取全部 EACCES
+            directory.setReadable(true, false)
+            directory.setExecutable(true, false)
         }
         ensureDefaultWorkspaceDocs()
     }

@@ -566,7 +566,12 @@ internal object AgentImageAttachmentSupport {
         val sinceLast = System.currentTimeMillis() - lastVlmCallMs
         if (sinceLast < 500) delay(500 - sinceLast)
 
-        val scaledDataUrl = downscaleImageIfNeeded(dataUrlForVlm, maxDimension = 1024)
+        // ★ 远程 URL（自动化截图）需要下载后缩放；聊天上传的 data URL 已在 prepareSingleAttachment 中压缩过，不再重复压缩
+        val scaledDataUrl = if (imageDataUrl.startsWith("http://") || imageDataUrl.startsWith("https://")) {
+            downscaleImageIfNeeded(dataUrlForVlm, maxDimension = 1024)
+        } else {
+            dataUrlForVlm
+        }
 
         var lastError: Throwable? = null
         repeat(3) { attempt ->
