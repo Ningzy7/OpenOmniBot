@@ -188,6 +188,10 @@ android {
         lintConfig = file("../lint.xml")
         // 将错误视为警告继续构建
         abortOnError = false
+        // 禁用 release 构建的 lint 检查（节省内存）
+        checkReleaseBuilds = false
+        // 忽略测试源码
+        ignoreTestSources = true
     }
 }
 
