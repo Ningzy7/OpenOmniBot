@@ -476,7 +476,7 @@ internal object AgentImageAttachmentSupport {
     private val vlmDescriptionCache = mutableMapOf<String, String>()
     private var lastVlmCallMs = 0L
 
-    /** 缩放 base64 data URL 到 maxDimension 以内，保持宽高比。采样解码避免大图 OOM。JPEG quality=70。 */
+    /** 缩放 base64 data URL 到 maxDimension 以内，保持宽高比。采样解码避免大图 OOM。JPEG quality=85。 */
     internal fun downscaleImageIfNeeded(dataUrl: String, maxDimension: Int): String {
         try {
             val commaIndex = dataUrl.indexOf(',')
@@ -499,7 +499,7 @@ internal object AgentImageAttachmentSupport {
                 val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
                 if (bitmap == null) return dataUrl
                 val output = java.io.ByteArrayOutputStream()
-                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, output)
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, output)
                 bitmap.recycle()
                 val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
                 return "data:image/jpeg;base64,$encoded"
@@ -517,7 +517,7 @@ internal object AgentImageAttachmentSupport {
             val sampledMaxSide = maxOf(sampled.width, sampled.height)
             if (sampledMaxSide <= maxDimension) {
                 val output = java.io.ByteArrayOutputStream()
-                sampled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, output)
+                sampled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, output)
                 sampled.recycle()
                 val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
                 return "data:image/jpeg;base64,$encoded"
@@ -530,7 +530,7 @@ internal object AgentImageAttachmentSupport {
             sampled.recycle()
 
             val output = java.io.ByteArrayOutputStream()
-            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, output)
+            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, output)
             scaled.recycle()
 
             val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
@@ -543,7 +543,7 @@ internal object AgentImageAttachmentSupport {
 
     /**
      * 调用 scene.vlm.operation.primary 描述图片内容返回文本。
-     * 缩放 max(w,h)<=768, JPEG quality=70, 采样解码防大图 OOM, 缓存 32 张, 限流 500ms, 重试 3 次
+     * 缩放 max(w,h)<=1024, JPEG quality=85, 采样解码防大图 OOM, 缓存 32 张, 限流 500ms, 重试 3 次
      */
     internal suspend fun describeImageViaVlm(imageDataUrl: String): String {
         // ★ 远程 URL 需要先下载转 base64
@@ -566,7 +566,7 @@ internal object AgentImageAttachmentSupport {
         val sinceLast = System.currentTimeMillis() - lastVlmCallMs
         if (sinceLast < 500) delay(500 - sinceLast)
 
-        val scaledDataUrl = downscaleImageIfNeeded(dataUrlForVlm, maxDimension = 768)
+        val scaledDataUrl = downscaleImageIfNeeded(dataUrlForVlm, maxDimension = 1024)
 
         var lastError: Throwable? = null
         repeat(3) { attempt ->
