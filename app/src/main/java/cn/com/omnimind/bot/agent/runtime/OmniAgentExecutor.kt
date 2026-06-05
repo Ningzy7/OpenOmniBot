@@ -360,19 +360,6 @@ class OmniAgentExecutor(
         } else rawText
 
         val content: JsonElement = JsonPrimitive(combinedText)
-        } else {
-            buildJsonArray {
-                if (combinedText.isNotBlank()) {
-                    add(
-                        buildJsonObject {
-                            put("type", "text")
-                            put("text", combinedText)
-                        }
-                    )
-                }
-                imageParts.forEach { add(it) }
-            }
-        }
         return cn.com.omnimind.baselib.llm.ChatCompletionMessage(
             role = "user",
             content = content
