@@ -330,10 +330,15 @@ class OmniAgentExecutor(
         userMessage: String,
         attachments: List<Map<String, Any?>>
     ): cn.com.omnimind.baselib.llm.ChatCompletionMessage {
-        // 不过滤 sendToModel：所有图片附件都需过 VLM 描述。
-        // 直接用 AgentImageAttachmentSupport（支持 path→dataUrl→url 多级 fallback）。
+        val rawText = AgentAttachmentPromptSupport.buildUserMessageText(
+            text = userMessage,
+            attachments = attachments
+        )
         val vlmDescriptions = mutableListOf<String>()
 
+        // UNFILTERED VLM: process ALL attachments, not just sendToModel=true.
+        // User-uploaded images have sendToModel=false (to avoid sending image_url
+        // to multimodal models), but our text-only agent must use VLM descriptions.
         for (attachment in attachments) {
             val isImage = AgentImageAttachmentSupport.isImageAttachment(attachment)
             if (!isImage) continue
@@ -353,12 +358,74 @@ class OmniAgentExecutor(
         } else ""
 
         val combinedText = if (descriptionText.isNotBlank()) {
-            if (userMessage.isNotBlank()) "$userMessage\n\n$descriptionText" else descriptionText
-        } else userMessage
+            if (rawText.isNotBlank()) "$rawText\n\n$descriptionText" else descriptionText
+        } else rawText
 
-        val content: JsonElement = JsonPrimitive(combinedText)
+        val content: JsonElement = if (imageParts.isEmpty()) {
+            JsonPrimitive(combinedText)
+        } else {
+            buildJsonArray {
+                if (combinedText.isNotBlank()) {
+                    add(
+                        buildJsonObject {
+                            put("type", "text")
+                            put("text", combinedText)
+                        }
+                    )
+                }
+                imageParts.forEach { add(it) }
+            }
+        }
         return cn.com.omnimind.baselib.llm.ChatCompletionMessage(
             role = "user",
             content = content
         )
     }
+
+    private data class PromptAttachment(
+        val isImage: Boolean,
+        val url: String?,
+        val dataUrl: String?,
+        val path: String?,
+        val mimeType: String?
+    )
+
+    private fun normalizeAttachments(attachments: List<Map<String, Any?>>): List<PromptAttachment> {
+        return attachments.map { item ->
+            val mimeType = item["mimeType"]?.toString()?.trim()
+            val explicitImage = item["isImage"]?.toString()?.toBooleanStrictOrNull()
+            val isImage = explicitImage ?: mimeType.orEmpty().lowercase().startsWith("image/")
+            PromptAttachment(
+                isImage = isImage,
+                url = item["url"]?.toString(),
+                dataUrl = item["dataUrl"]?.toString(),
+                path = item["path"]?.toString(),
+                mimeType = mimeType
+            )
+        }
+    }
+
+    private fun resolveImageAttachmentUrl(attachment: PromptAttachment): String {
+        val dataUrl = attachment.dataUrl.orEmpty().trim()
+        if (dataUrl.startsWith("data:")) return dataUrl
+
+        val remoteUrl = attachment.url.orEmpty().trim()
+        if (remoteUrl.startsWith("https://") || remoteUrl.startsWith("http://") || remoteUrl.startsWith("data:")) {
+            return remoteUrl
+        }
+        val path = attachment.path.orEmpty().trim()
+        if (path.isNotEmpty()) {
+            val resolved = AgentImageAttachmentSupport.resolveImageAttachmentUrl(
+                mapOf(
+                    "path" to path,
+                    "mimeType" to attachment.mimeType,
+                    "isImage" to attachment.isImage
+                )
+            )
+            if (resolved.isNotBlank()) {
+                return resolved
+            }
+        }
+        return ""
+    }
+}
