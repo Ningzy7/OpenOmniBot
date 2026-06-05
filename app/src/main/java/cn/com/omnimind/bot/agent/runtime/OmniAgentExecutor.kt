@@ -334,9 +334,10 @@ class OmniAgentExecutor(
             text = userMessage,
             attachments = attachments
         )
-        val normalizedAttachments = normalizeAttachments(
-            attachments.filter(AgentAttachmentPromptSupport::shouldSendAttachmentToModel)
-        )
+        // 不过滤 sendToModel：所有图片附件都需过 VLM 描述。
+        // 上游对用户上传的附件设 sendToModel=false（避免发 image_url 给多模态模型），
+        // 但主 Agent 是纯文本模型，必须用 VLM 描述替代。
+        val normalizedAttachments = normalizeAttachments(attachments)
         val vlmDescriptions = mutableListOf<String>()
 
         // ★ 用户上传图片时先用 VLM 描述，避免纯文本模型 400
