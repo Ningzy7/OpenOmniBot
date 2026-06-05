@@ -382,7 +382,7 @@ class OmniAgentExecutor(
             // 上游附件有 path(Android绝对路径) 和 workspacePath(proot路径) 两个字段。
             // 在 Alpine proot 环境中只能访问 workspacePath，优先用它作为 VLM 图片读取路径。
             val rawPath = item["workspacePath"]?.toString()?.trim()
-                .takeIf { it.isNotEmpty() }
+                ?.takeIf { it.isNotEmpty() }
                 ?: item["path"]?.toString()?.trim()
             PromptAttachment(
                 isImage = isImage,
