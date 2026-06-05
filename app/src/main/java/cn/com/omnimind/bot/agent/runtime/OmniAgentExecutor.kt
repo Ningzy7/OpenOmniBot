@@ -330,10 +330,6 @@ class OmniAgentExecutor(
         userMessage: String,
         attachments: List<Map<String, Any?>>
     ): cn.com.omnimind.baselib.llm.ChatCompletionMessage {
-        val rawText = AgentAttachmentPromptSupport.buildUserMessageText(
-            text = userMessage,
-            attachments = attachments
-        )
         // 不过滤 sendToModel：所有图片附件都需过 VLM 描述。
         // 上游对用户上传的附件设 sendToModel=false（避免发 image_url 给多模态模型），
         // 但主 Agent 是纯文本模型，必须用 VLM 描述替代。
@@ -349,6 +345,7 @@ class OmniAgentExecutor(
                 vlmDescriptions.add(description)
             } catch (e: Exception) {
                 OmniLog.w(tag, "VLM 描述失败，跳过图片: ${e.message}")
+                vlmDescriptions.add("【VLM 描述失败: ${e.message}】")
             }
         }
 
@@ -357,8 +354,8 @@ class OmniAgentExecutor(
         } else ""
 
         val combinedText = if (descriptionText.isNotBlank()) {
-            if (rawText.isNotBlank()) "$rawText\n\n$descriptionText" else descriptionText
-        } else rawText
+            if (userMessage.isNotBlank()) "$userMessage\n\n$descriptionText" else descriptionText
+        } else userMessage
 
         val content: JsonElement = JsonPrimitive(combinedText)
         return cn.com.omnimind.baselib.llm.ChatCompletionMessage(
