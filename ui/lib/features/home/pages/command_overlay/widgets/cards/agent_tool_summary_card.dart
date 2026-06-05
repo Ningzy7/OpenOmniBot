@@ -1,11 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:ui/features/home/pages/chat/tool_activity_utils.dart';
 import 'package:ui/features/home/pages/command_overlay/widgets/cards/agent_tool_transcript.dart';
+import 'package:ui/features/home/pages/command_overlay/widgets/cards/codex_diff_viewer.dart';
 import 'package:ui/l10n/legacy_text_localizer.dart';
 import 'package:ui/services/app_background_service.dart';
+import 'package:ui/services/codex_diff_parser.dart';
+import 'package:ui/services/codex_tool_call_parser.dart';
 import 'package:ui/theme/theme_context.dart';
 
 class AgentToolSummaryCard extends StatefulWidget {
@@ -30,6 +35,13 @@ class _AgentToolSummaryCardState extends State<AgentToolSummaryCard> {
   @override
   Widget build(BuildContext context) {
     final cardData = widget.cardData;
+    if (_usesInlineToolStyle(cardData)) {
+      return _InlineToolCallCard(
+        cardData: cardData,
+        visualProfile: widget.visualProfile,
+      );
+    }
+
     final status = (cardData['status'] ?? 'running').toString();
     final title = resolveAgentToolTitle(cardData);
     final statusLabel = resolveAgentToolStatusLabel(cardData);
@@ -50,13 +62,9 @@ class _AgentToolSummaryCardState extends State<AgentToolSummaryCard> {
             palette.surfaceSecondary,
           )
         : statusColor.withValues(alpha: 0.08);
-    final cardBorderColor = context.isDarkTheme
-        ? Color.lerp(
-            palette.borderSubtle,
-            statusColor,
-            0.18,
-          )!.withValues(alpha: 0.92)
-        : Colors.transparent;
+    final cardBorder = context.isDarkTheme
+        ? null
+        : Border.all(color: Colors.transparent);
     final statusTagBackgroundColor = context.isDarkTheme
         ? Color.alphaBlend(
             statusColor.withValues(alpha: 0.14),
@@ -94,7 +102,7 @@ class _AgentToolSummaryCardState extends State<AgentToolSummaryCard> {
       typeLabel: typeLabel,
       statusLabel: statusLabel,
       cardBackgroundColor: cardBackgroundColor,
-      cardBorderColor: cardBorderColor,
+      cardBorder: cardBorder,
       statusTagBackgroundColor: statusTagBackgroundColor,
       statusTagTextColor: statusTagTextColor,
     );
@@ -150,10 +158,11 @@ class _AgentToolSummaryCardState extends State<AgentToolSummaryCard> {
     required String typeLabel,
     required String statusLabel,
     required Color cardBackgroundColor,
-    required Color cardBorderColor,
+    required Border? cardBorder,
     required Color statusTagBackgroundColor,
     required Color statusTagTextColor,
   }) {
+    final diffStatLabel = _resolveDiffStatLabel(cardData);
     return Material(
       color: Colors.transparent,
       borderRadius: BorderRadius.circular(999),
@@ -162,7 +171,7 @@ class _AgentToolSummaryCardState extends State<AgentToolSummaryCard> {
         decoration: BoxDecoration(
           color: cardBackgroundColor,
           borderRadius: BorderRadius.circular(999),
-          border: Border.all(color: cardBorderColor),
+          border: cardBorder,
         ),
         child: InkWell(
           onTap: () =>
@@ -185,6 +194,10 @@ class _AgentToolSummaryCardState extends State<AgentToolSummaryCard> {
                           style: titleStyle,
                         ),
                 ),
+                if (diffStatLabel != null) ...[
+                  const SizedBox(width: 8),
+                  _DiffStatBadge(label: diffStatLabel),
+                ],
                 const SizedBox(width: 8),
                 Container(
                   padding: const EdgeInsets.symmetric(
@@ -212,6 +225,616 @@ class _AgentToolSummaryCardState extends State<AgentToolSummaryCard> {
       ),
     );
   }
+}
+
+String? _resolveDiffStatLabel(Map<String, dynamic> cardData) {
+  if ((cardData['toolType'] ?? '').toString() != 'file') {
+    return null;
+  }
+  final additions = _asNonNegativeInt(cardData['additions']);
+  final deletions = _asNonNegativeInt(cardData['deletions']);
+  final changedFiles = _asNonNegativeInt(cardData['changedFiles']);
+  if (changedFiles <= 0 && additions <= 0 && deletions <= 0) {
+    return null;
+  }
+  return formatCodexDiffStat(additions: additions, deletions: deletions);
+}
+
+int _asNonNegativeInt(dynamic value) {
+  final parsed = value is int
+      ? value
+      : value is num
+      ? value.toInt()
+      : int.tryParse(value?.toString() ?? '') ?? 0;
+  return parsed < 0 ? 0 : parsed;
+}
+
+class _DiffStatBadge extends StatelessWidget {
+  const _DiffStatBadge({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: context.omniPalette.textSecondary,
+          fontSize: 9.5,
+          fontWeight: FontWeight.w700,
+          height: 1,
+        ),
+      ),
+    );
+  }
+}
+
+bool _isInlineFileTool(Map<String, dynamic> cardData) {
+  return (cardData['toolType'] ?? '').toString().trim() == 'file';
+}
+
+bool _isCodexInlineTool(Map<String, dynamic> cardData) {
+  if ((cardData['uiStyle'] ?? '').toString().trim() == 'codex_tool') {
+    return true;
+  }
+  final toolName = (cardData['toolName'] ?? '').toString().trim();
+  if (toolName.startsWith('codex.')) {
+    return true;
+  }
+  for (final rawJson in [
+    (cardData['rawResultJson'] ?? '').toString(),
+    (cardData['resultPreviewJson'] ?? '').toString(),
+  ]) {
+    final decoded = _decodeJsonMap(rawJson);
+    final itemType = (decoded['type'] ?? '').toString();
+    if (isCodexToolItemType(itemType)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool _usesInlineToolStyle(Map<String, dynamic> cardData) {
+  return _isInlineFileTool(cardData) || _isCodexInlineTool(cardData);
+}
+
+class _InlineToolCallCard extends StatefulWidget {
+  const _InlineToolCallCard({
+    required this.cardData,
+    required this.visualProfile,
+  });
+
+  final Map<String, dynamic> cardData;
+  final AppBackgroundVisualProfile visualProfile;
+
+  @override
+  State<_InlineToolCallCard> createState() => _InlineToolCallCardState();
+}
+
+class _InlineToolCallCardState extends State<_InlineToolCallCard> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final cardData = widget.cardData;
+    final palette = context.omniPalette;
+    final title = resolveAgentToolTitle(cardData);
+    final status = (cardData['status'] ?? 'running').toString();
+    final toolType = (cardData['toolType'] ?? '').toString().trim();
+    final isFileTool = _isInlineFileTool(cardData);
+    final isCodexTool = _isCodexInlineTool(cardData);
+    final diffSummary = isFileTool ? _resolveInlineDiffSummary(cardData) : null;
+    final hasDiff =
+        isFileTool && diffSummary != null && diffSummary.files.isNotEmpty;
+    final diffStatLabel = isFileTool
+        ? diffSummary == null
+              ? _resolveDiffStatLabel(cardData)
+              : formatCodexDiffStat(
+                  additions: diffSummary.additions,
+                  deletions: diffSummary.deletions,
+                )
+        : null;
+    final tooltipSubtitle = _inlineToolSubtitle(cardData, diffSummary, title);
+    final filePath = isFileTool
+        ? _resolveInlineFilePath(cardData, diffSummary)
+        : '';
+    final fileName = isFileTool ? _lastPathSegment(filePath) : '';
+    final trailingLabel = isFileTool
+        ? ''
+        : _inlineToolTrailingLabel(cardData, status: status);
+    final useLightProfile =
+        !context.isDarkTheme && widget.visualProfile.usesLightText;
+    final titleColor = context.isDarkTheme
+        ? palette.textSecondary.withValues(alpha: 0.92)
+        : useLightProfile
+        ? Colors.white.withValues(alpha: 0.72)
+        : widget.visualProfile.secondaryTextColor.withValues(alpha: 0.88);
+    final mutedColor = context.isDarkTheme
+        ? palette.textSecondary.withValues(alpha: 0.64)
+        : useLightProfile
+        ? Colors.white.withValues(alpha: 0.50)
+        : widget.visualProfile.secondaryTextColor.withValues(alpha: 0.58);
+    final pressedOverlayColor = context.isDarkTheme
+        ? palette.surfaceSecondary.withValues(alpha: 0.38)
+        : useLightProfile
+        ? Colors.white.withValues(alpha: 0.08)
+        : Colors.black.withValues(alpha: 0.035);
+    final maxDiffHeight = math.max(
+      220.0,
+      math.min(460.0, MediaQuery.sizeOf(context).height * 0.58),
+    );
+
+    return Tooltip(
+      message: [
+        title,
+        if (tooltipSubtitle.isNotEmpty) tooltipSubtitle,
+        if (diffStatLabel != null) diffStatLabel,
+      ].join('\n'),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: MediaQuery.sizeOf(context).width * 0.90,
+          ),
+          child: Container(
+            margin: const EdgeInsets.only(top: 6, bottom: 4),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Material(
+                  color: Colors.transparent,
+                  borderRadius: BorderRadius.circular(8),
+                  clipBehavior: Clip.antiAlias,
+                  child: InkWell(
+                    key: const ValueKey('inline-file-diff-title-toggle'),
+                    onTap: hasDiff
+                        ? () => setState(() => _expanded = !_expanded)
+                        : isCodexTool
+                        ? () => unawaited(
+                            showAgentToolDetailSheet(
+                              context,
+                              cardData: cardData,
+                            ),
+                          )
+                        : null,
+                    splashColor: pressedOverlayColor,
+                    highlightColor: pressedOverlayColor,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(2, 5, 5, 5),
+                      child: Row(
+                        children: [
+                          Icon(
+                            resolveAgentToolStatusIcon(status, toolType),
+                            size: 16,
+                            color: mutedColor,
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: _InlineFileTitleText(
+                              title: title,
+                              fileName: fileName,
+                              fullPath: filePath,
+                              baseStyle: TextStyle(
+                                color: titleColor,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w500,
+                                letterSpacing: 0,
+                                height: 1.18,
+                              ),
+                              fileNameColor: palette.accentPrimary,
+                              shimmer: isCodexTool && status == 'running',
+                            ),
+                          ),
+                          if (diffStatLabel != null) ...[
+                            const SizedBox(width: 8),
+                            _InlineDiffStatText(
+                              label: diffStatLabel,
+                              additions:
+                                  diffSummary?.additions ??
+                                  _asNonNegativeInt(cardData['additions']),
+                              deletions:
+                                  diffSummary?.deletions ??
+                                  _asNonNegativeInt(cardData['deletions']),
+                              mutedColor: mutedColor,
+                            ),
+                          ],
+                          if (trailingLabel.isNotEmpty) ...[
+                            const SizedBox(width: 8),
+                            Text(
+                              trailingLabel,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: mutedColor,
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w700,
+                                height: 1,
+                              ),
+                            ),
+                          ],
+                          if (hasDiff) ...[
+                            const SizedBox(width: 4),
+                            AnimatedRotation(
+                              turns: _expanded ? 0.5 : 0,
+                              duration: const Duration(milliseconds: 220),
+                              curve: Curves.easeOutCubic,
+                              child: Icon(
+                                LucideIcons.chevronDown,
+                                size: 18,
+                                color: mutedColor,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                AnimatedSize(
+                  duration: const Duration(milliseconds: 260),
+                  curve: Curves.easeOutCubic,
+                  alignment: Alignment.topLeft,
+                  child: _expanded && hasDiff
+                      ? Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: ConstrainedBox(
+                            constraints: BoxConstraints(
+                              maxHeight: maxDiffHeight,
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(14),
+                              child: CodexDiffViewer(
+                                summary: diffSummary,
+                                padding: const EdgeInsets.fromLTRB(0, 0, 0, 0),
+                                showOverview: false,
+                                showFileHeaders: false,
+                              ),
+                            ),
+                          ),
+                        )
+                      : const SizedBox.shrink(),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _InlineFileTitleText extends StatelessWidget {
+  const _InlineFileTitleText({
+    required this.title,
+    required this.fileName,
+    required this.fullPath,
+    required this.baseStyle,
+    required this.fileNameColor,
+    this.shimmer = false,
+  });
+
+  final String title;
+  final String fileName;
+  final String fullPath;
+  final TextStyle baseStyle;
+  final Color fileNameColor;
+  final bool shimmer;
+
+  @override
+  Widget build(BuildContext context) {
+    final parts = _splitTitleAroundFileName(title, fileName);
+    if (parts.fileName.isEmpty) {
+      if (shimmer) {
+        return _FlowingToolTitleText(text: title, style: baseStyle);
+      }
+      return Text(
+        title,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: baseStyle,
+      );
+    }
+
+    final titleRow = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (parts.prefix.isNotEmpty)
+          Flexible(
+            child: Text(
+              parts.prefix,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: baseStyle,
+            ),
+          ),
+        Flexible(
+          child: Tooltip(
+            message: fullPath.isEmpty ? parts.fileName : fullPath,
+            triggerMode: TooltipTriggerMode.tap,
+            waitDuration: Duration.zero,
+            showDuration: const Duration(seconds: 3),
+            child: Text(
+              parts.fileName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: baseStyle.copyWith(
+                color: fileNameColor,
+                decoration: TextDecoration.underline,
+                decorationColor: fileNameColor,
+              ),
+            ),
+          ),
+        ),
+        if (parts.suffix.isNotEmpty)
+          Flexible(
+            child: Text(
+              parts.suffix,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: baseStyle,
+            ),
+          ),
+      ],
+    );
+    if (!shimmer) {
+      return titleRow;
+    }
+    return _FlowingInlineToolTitle(
+      baseColor: baseStyle.color ?? context.omniPalette.textSecondary,
+      child: titleRow,
+    );
+  }
+}
+
+class _InlineFileTitleParts {
+  const _InlineFileTitleParts({
+    required this.prefix,
+    required this.fileName,
+    required this.suffix,
+  });
+
+  final String prefix;
+  final String fileName;
+  final String suffix;
+}
+
+_InlineFileTitleParts _splitTitleAroundFileName(String title, String fileName) {
+  final normalizedTitle = title.trim();
+  final normalizedFileName = fileName.trim();
+  if (normalizedFileName.isEmpty) {
+    return _InlineFileTitleParts(
+      prefix: normalizedTitle,
+      fileName: '',
+      suffix: '',
+    );
+  }
+  final index = normalizedTitle.lastIndexOf(normalizedFileName);
+  if (index >= 0) {
+    return _InlineFileTitleParts(
+      prefix: normalizedTitle.substring(0, index),
+      fileName: normalizedFileName,
+      suffix: normalizedTitle.substring(index + normalizedFileName.length),
+    );
+  }
+  final prefix = normalizedTitle.isEmpty ? '' : '$normalizedTitle · ';
+  return _InlineFileTitleParts(
+    prefix: prefix,
+    fileName: normalizedFileName,
+    suffix: '',
+  );
+}
+
+class _InlineDiffStatText extends StatelessWidget {
+  const _InlineDiffStatText({
+    required this.label,
+    required this.additions,
+    required this.deletions,
+    required this.mutedColor,
+  });
+
+  final String label;
+  final int additions;
+  final int deletions;
+  final Color mutedColor;
+
+  @override
+  Widget build(BuildContext context) {
+    final addColor = context.isDarkTheme
+        ? const Color(0xFF7EE787)
+        : const Color(0xFF1A7F37);
+    final deleteColor = context.isDarkTheme
+        ? const Color(0xFFFF7B72)
+        : const Color(0xFFCF222E);
+    final parts = label.split(' ');
+    if (parts.length == 2 && parts.first.startsWith('+')) {
+      return RichText(
+        text: TextSpan(
+          style: TextStyle(
+            color: mutedColor,
+            fontSize: 10.5,
+            fontWeight: FontWeight.w700,
+            height: 1,
+          ),
+          children: [
+            TextSpan(
+              text: parts.first,
+              style: TextStyle(color: additions > 0 ? addColor : mutedColor),
+            ),
+            const TextSpan(text: ' '),
+            TextSpan(
+              text: parts.last,
+              style: TextStyle(color: deletions > 0 ? deleteColor : mutedColor),
+            ),
+          ],
+        ),
+      );
+    }
+    return Text(
+      label,
+      style: TextStyle(
+        color: mutedColor,
+        fontSize: 10.5,
+        fontWeight: FontWeight.w700,
+        height: 1,
+      ),
+    );
+  }
+}
+
+class _FlowingInlineToolTitle extends StatefulWidget {
+  const _FlowingInlineToolTitle({required this.child, required this.baseColor});
+
+  final Widget child;
+  final Color baseColor;
+
+  @override
+  State<_FlowingInlineToolTitle> createState() =>
+      _FlowingInlineToolTitleState();
+}
+
+class _FlowingInlineToolTitleState extends State<_FlowingInlineToolTitle>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1800),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (MediaQuery.disableAnimationsOf(context)) {
+      return widget.child;
+    }
+    final highlightColor = context.isDarkTheme
+        ? Colors.white.withValues(alpha: 0.96)
+        : Colors.white.withValues(alpha: 0.92);
+    return AnimatedBuilder(
+      animation: _controller,
+      child: widget.child,
+      builder: (context, child) {
+        return ShaderMask(
+          blendMode: BlendMode.srcIn,
+          shaderCallback: (bounds) {
+            final textWidth = bounds.width <= 0 ? 1.0 : bounds.width;
+            final shimmerWidth = (textWidth * 0.72)
+                .clamp(52.0, 180.0)
+                .toDouble();
+            final travelDistance = textWidth + shimmerWidth;
+            final shimmerLeft =
+                bounds.left - shimmerWidth + travelDistance * _controller.value;
+            return LinearGradient(
+              begin: Alignment.centerLeft,
+              end: Alignment.centerRight,
+              colors: [widget.baseColor, highlightColor, widget.baseColor],
+              stops: const [0.08, 0.5, 0.92],
+            ).createShader(
+              Rect.fromLTWH(
+                shimmerLeft,
+                bounds.top,
+                shimmerWidth,
+                bounds.height,
+              ),
+            );
+          },
+          child: child,
+        );
+      },
+    );
+  }
+}
+
+CodexDiffSummary? _resolveInlineDiffSummary(Map<String, dynamic> cardData) {
+  final diffText = (cardData['diffText'] ?? '').toString();
+  final extracted = extractCodexDiffText(
+    <String, dynamic>{
+      ...cardData,
+      if (diffText.isNotEmpty) 'diffText': diffText,
+    },
+    outputText: diffText.isNotEmpty
+        ? diffText
+        : resolveAgentToolTerminalOutput(cardData),
+    progress: (cardData['progress'] ?? '').toString(),
+    summary: (cardData['summary'] ?? '').toString(),
+  );
+  if (extracted == null || extracted.trim().isEmpty) {
+    return null;
+  }
+  final summary = parseCodexDiffText(extracted);
+  return summary.files.isEmpty ? null : summary;
+}
+
+String _resolveInlineFilePath(
+  Map<String, dynamic> cardData,
+  CodexDiffSummary? diffSummary,
+) {
+  final filePath = (cardData['filePath'] ?? '').toString().trim();
+  if (filePath.isNotEmpty) {
+    return filePath;
+  }
+  final primaryPath = (diffSummary?.primaryPath ?? '').trim();
+  if (primaryPath.isNotEmpty) {
+    return primaryPath;
+  }
+  return '';
+}
+
+String _lastPathSegment(String path) {
+  final trimmed = path.trim();
+  if (trimmed.isEmpty) {
+    return '';
+  }
+  final normalized = trimmed.replaceAll('\\', '/');
+  final segments = normalized.split('/').where((part) => part.isNotEmpty);
+  if (segments.isEmpty) {
+    return normalized;
+  }
+  return segments.last;
+}
+
+String _inlineToolSubtitle(
+  Map<String, dynamic> cardData,
+  CodexDiffSummary? diffSummary,
+  String title,
+) {
+  final filePath = (cardData['filePath'] ?? '').toString().trim();
+  if (filePath.isNotEmpty && filePath != title) {
+    return filePath;
+  }
+  final primaryPath = (diffSummary?.primaryPath ?? '').trim();
+  if (primaryPath.isNotEmpty && primaryPath != title) {
+    return primaryPath;
+  }
+  final preview = resolveAgentToolPreview(cardData).trim();
+  if (preview.isNotEmpty && preview != title) {
+    return preview;
+  }
+  final summary = (cardData['summary'] ?? '').toString().trim();
+  if (summary.isNotEmpty && summary != title) {
+    return summary;
+  }
+  return '';
+}
+
+String _inlineToolTrailingLabel(
+  Map<String, dynamic> cardData, {
+  required String status,
+}) {
+  final label = status == 'running'
+      ? resolveAgentToolTypeLabel(cardData)
+      : resolveAgentToolStatusLabel(cardData);
+  return label.trim();
 }
 
 bool _isSubagentTool(Map<String, dynamic> cardData) {
@@ -697,7 +1320,7 @@ class _SubagentStatusLine extends StatelessWidget {
                   duration: const Duration(milliseconds: 220),
                   curve: Curves.easeOutCubic,
                   child: Icon(
-                    Icons.keyboard_arrow_down_rounded,
+                    LucideIcons.chevronDown,
                     size: 15,
                     color: color.withValues(alpha: 0.78),
                   ),
@@ -861,17 +1484,17 @@ class _SubagentTimelineRow extends StatelessWidget {
     switch (kind) {
       case 'thinking_started':
       case 'thinking':
-        return Icons.psychology_alt_rounded;
+        return LucideIcons.brain;
       case 'tool_started':
       case 'tool_progress':
       case 'tool_completed':
-        return Icons.build_circle_outlined;
+        return LucideIcons.wrench;
       case 'subagent_completed':
-        return Icons.check_rounded;
+        return LucideIcons.check;
       case 'subagent_failed':
-        return Icons.error_outline_rounded;
+        return LucideIcons.triangleAlert;
       default:
-        return Icons.hub_outlined;
+        return LucideIcons.network;
     }
   }
 }

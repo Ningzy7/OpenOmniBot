@@ -4,6 +4,10 @@ export PATH=/root/.npm-global/bin:/root/.local/bin:/bin:/sbin:/usr/bin:/usr/sbin
 export HOME=/root
 HEADLESS_MODE="${OMNIBOT_HEADLESS:-0}"
 
+if [ -n "$OMNIBOT_USER_ENV_FILE" ] && [ -r "$OMNIBOT_USER_ENV_FILE" ]; then
+    . "$OMNIBOT_USER_ENV_FILE"
+fi
+
 if [ ! -s /etc/resolv.conf ]; then
     echo "nameserver 8.8.8.8" > /etc/resolv.conf
 fi
@@ -39,23 +43,25 @@ if [ "$HEADLESS_MODE" = "1" ]; then
 else
     export PS1="\[\e[38;5;46m\]\u\[\033[39m\]@reterm \[\033[39m\]\w \[\033[0m\]\\$ "
 fi
-# shellcheck disable=SC2034
 export PIP_BREAK_SYSTEM_PACKAGES=1
-required_packages="bash gcompat glib nano"
-missing_packages=""
-for pkg in $required_packages; do
-    if ! apk info -e $pkg >/dev/null 2>&1; then
-        missing_packages="$missing_packages $pkg"
+
+if [ "$HEADLESS_MODE" != "1" ] && [ "$#" -eq 0 ]; then
+    required_packages="bash gcompat glib nano"
+    missing_packages=""
+    for pkg in $required_packages; do
+        if ! apk info -e $pkg >/dev/null 2>&1; then
+            missing_packages="$missing_packages $pkg"
+        fi
+    done
+    if [ -n "$missing_packages" ]; then
+        echo -e "\e[34;1m[*] \e[0mInstalling Important packages\e[0m"
+        if apk add --no-cache $missing_packages; then
+            echo -e "\e[32;1m[+] \e[0mSuccessfully Installed\e[0m"
+        else
+            echo -e "\e[31;1m[!] \e[0mFailed to install important packages automatically\e[0m"
+        fi
+        echo -e "\e[34m[*] \e[0mUse \e[32mapk\e[0m to install new packages\e[0m"
     fi
-done
-if [ -n "$missing_packages" ] && [ "$HEADLESS_MODE" != "1" ]; then
-    echo -e "\e[34;1m[*] \e[0mInstalling Important packages\e[0m"
-    apk update && apk upgrade
-    apk add $missing_packages
-    if [ $? -eq 0 ]; then
-        echo -e "\e[32;1m[+] \e[0mSuccessfully Installed\e[0m"
-    fi
-    echo -e "\e[34m[*] \e[0mUse \e[32mapk\e[0m to install new packages\e[0m"
 fi
 
 #fix linker warning

@@ -2,6 +2,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ui/services/chat_terminal_environment_service.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   List<ChatTerminalEnvironmentVariable> variables() {
     return const [
       ChatTerminalEnvironmentVariable(key: 'FIRST', value: '1'),
@@ -20,11 +22,7 @@ void main() {
       ),
     );
 
-    expect(next.map((item) => item.key).toList(), [
-      'FIRST',
-      'SECOND',
-      'THIRD',
-    ]);
+    expect(next.map((item) => item.key).toList(), ['FIRST', 'SECOND', 'THIRD']);
     expect(next.map((item) => item.value).toList(), ['1', 'updated', '3']);
   });
 
@@ -63,5 +61,9 @@ void main() {
       ),
       isTrue,
     );
+  });
+
+  test('syncNativeVariables is optional outside Android host', () async {
+    await ChatTerminalEnvironmentService.syncNativeVariables(variables());
   });
 }

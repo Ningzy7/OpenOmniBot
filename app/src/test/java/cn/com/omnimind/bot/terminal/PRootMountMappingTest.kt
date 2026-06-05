@@ -40,4 +40,32 @@ class PRootMountMappingTest {
             hostPath
         )
     }
+
+    @Test
+    fun mapLinuxPathToHostPathMapsMtManagerStorageMounts() {
+        val mountPath = PRootMountMapping.mapLinuxPathToHostPath(
+            linuxPath = "/mnt/mt/projects/demo.txt",
+            rootfsRoot = File("/tmp/fake-rootfs"),
+            homeDir = "/data/user/0/cn.com.omnimind.bot/files",
+            workspaceDir = "/data/user/0/cn.com.omnimind.bot/workspace",
+            appDataDir = "/data/user/0/cn.com.omnimind.bot",
+            packageName = "cn.com.omnimind.bot",
+            chrootEnabled = false
+        )
+        val shortcutPath = PRootMountMapping.mapLinuxPathToHostPath(
+            linuxPath = "/mt/projects/demo.txt",
+            rootfsRoot = File("/tmp/fake-rootfs"),
+            homeDir = "/data/user/0/cn.com.omnimind.bot/files",
+            workspaceDir = "/data/user/0/cn.com.omnimind.bot/workspace",
+            appDataDir = "/data/user/0/cn.com.omnimind.bot",
+            packageName = "cn.com.omnimind.bot",
+            chrootEnabled = false
+        )
+
+        assertEquals(
+            "/sdcard/projects/demo.txt",
+            mountPath
+        )
+        assertEquals(mountPath, shortcutPath)
+    }
 }

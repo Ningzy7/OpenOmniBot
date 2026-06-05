@@ -53,11 +53,13 @@ import cn.com.omnimind.bot.ui.scheduled.ScheduledTaskReminderLoader
 import cn.com.omnimind.bot.util.AssistsUtil
 import cn.com.omnimind.assists.controller.http.HttpController
 import cn.com.omnimind.baselib.util.SchemeUtil
+import cn.com.omnimind.bot.util.TaskRuntimeSettings
 import cn.com.omnimind.bot.agent.AgentCallback
 import cn.com.omnimind.bot.agent.AgentAlarmToolService
 import cn.com.omnimind.bot.agent.AgentAiCapabilityConfigSync
 import cn.com.omnimind.bot.agent.AgentConversationContextCompactor
 import cn.com.omnimind.bot.agent.AgentImageAttachmentSupport
+import cn.com.omnimind.bot.agent.AgentWorkspaceAttachmentSupport
 import cn.com.omnimind.bot.agent.AgentStreamEvent
 import cn.com.omnimind.bot.agent.AgentTextSanitizer
 import cn.com.omnimind.bot.agent.AgentModelOverride
@@ -529,6 +531,10 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
         var promptTokenThreshold: Int? = null
     )
 
+    private data class FailedAgentRetryContext(
+        val arguments: Map<String, Any?>
+    )
+
     private class ActiveAgentRunContext(
         val taskId: String,
         val job: Job,
@@ -688,6 +694,7 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
     private val activeAgentLock = Any()
 
     private val activeAgentRuns: MutableMap<String, ActiveAgentRunContext> = mutableMapOf()
+    private val failedAgentRetryContexts: MutableMap<String, FailedAgentRetryContext> = mutableMapOf()
     private val chatTaskPersistenceStates: MutableMap<String, ChatTaskPersistenceState> =
         mutableMapOf()
     private val conversationDomainService by lazy { ConversationDomainService(context) }
@@ -705,6 +712,24 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
     private fun registerChatTaskPersistenceState(taskId: String, state: ChatTaskPersistenceState) {
         synchronized(activeAgentLock) {
             chatTaskPersistenceStates[taskId] = state
+        }
+    }
+
+    private fun registerFailedAgentRetryContext(taskId: String, context: FailedAgentRetryContext) {
+        synchronized(activeAgentLock) {
+            failedAgentRetryContexts[taskId] = context
+        }
+    }
+
+    private fun getFailedAgentRetryContext(taskId: String): FailedAgentRetryContext? {
+        return synchronized(activeAgentLock) {
+            failedAgentRetryContexts[taskId]
+        }
+    }
+
+    private fun removeFailedAgentRetryContext(taskId: String): FailedAgentRetryContext? {
+        return synchronized(activeAgentLock) {
+            failedAgentRetryContexts.remove(taskId)
         }
     }
 
@@ -910,7 +935,7 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
     /**
      * 统一的 Flutter 事件派发：
      * 1) 始终在主线程调用；
-     * 2) 当前通道失败时回退到主引擎通道；
+     * 2) 同时投递到当前通道和主引擎通道；
      * 3) 避免事件派发异常导致进程崩溃。
      */
     private fun invokeFlutterEventSafely(method: String, arguments: Any? = null) {
@@ -923,16 +948,19 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
         }
 
         var lastError: Exception? = null
+        var delivered = false
         for (target in channels) {
             try {
                 target.invokeMethod(method, arguments)
-                return
+                delivered = true
             } catch (e: Exception) {
                 lastError = e
                 OmniLog.e(TAG, "invoke $method failed on one channel: ${e.message}")
             }
         }
-        OmniLog.e(TAG, "invoke $method failed on all channels: ${lastError?.message}")
+        if (!delivered) {
+            OmniLog.e(TAG, "invoke $method failed on all channels: ${lastError?.message}")
+        }
     }
 
     fun hasActiveAgentRuns(): Boolean {
@@ -1455,6 +1483,43 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
         }
     }
 
+    fun retryAgentTask(
+        call: MethodCall,
+        result: MethodChannel.Result
+    ) {
+        mainJob.launch {
+            try {
+                val taskId = call.argument<String>("taskId")?.trim().orEmpty()
+                if (taskId.isBlank()) {
+                    withContext(Dispatchers.Main) {
+                        result.error("INVALID_ARGUMENTS", "taskId is required", null)
+                    }
+                    return@launch
+                }
+                val retryContext = getFailedAgentRetryContext(taskId)
+                if (retryContext == null) {
+                    withContext(Dispatchers.Main) {
+                        result.error(
+                            "NO_RETRY_CONTEXT",
+                            "No retryable agent context found for taskId=$taskId",
+                            null
+                        )
+                    }
+                    return@launch
+                }
+                createAgentTask(
+                    MethodCall("createAgentTask", retryContext.arguments),
+                    result
+                )
+            } catch (e: Exception) {
+                OmniLog.e(TAG, "retryAgentTask error: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    result.error("RETRY_AGENT_TASK_ERROR", e.message, null)
+                }
+            }
+        }
+    }
+
     /**
      * 取消聊天任务
      */
@@ -1580,6 +1645,7 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
 
         mainJob.launch {
             try {
+                TaskRuntimeSettings.onTaskStarted(context)
                 val workspaceMemoryService = WorkspaceMemoryService(context)
                 val preparedContent = prepareChatTaskContent(
                     content = content,
@@ -1628,11 +1694,13 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                 }
             } catch (e: PermissionException) {
                 removeChatTaskPersistenceState(taskID)
+                TaskRuntimeSettings.onTaskFinished(context)
                 withContext(Dispatchers.Main) {
                     result.error("PERMISSION_ERROR", e.message, null)
                 }
             } catch (e: Exception) {
                 removeChatTaskPersistenceState(taskID)
+                TaskRuntimeSettings.onTaskFinished(context)
                 withContext(Dispatchers.Main) {
                     result.error("DO_TASK_ERROR", e.message, null)
                 }
@@ -1789,6 +1857,16 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                 conversation = payload
             )
         }
+        TaskRuntimeSettings.onTaskFinished(context)
+        if (persistenceState?.isError != true) {
+            TaskRuntimeSettings.notifyTaskFinished(
+                context = context,
+                title = "小万回复已完成",
+                message = "纯聊天回复已完成，点击查看详情",
+                conversationId = persistenceState?.conversationId,
+                conversationMode = persistenceState?.conversationMode
+            )
+        }
     }
 
     private suspend fun maybeAutoCompactChatOnlyConversation(
@@ -1876,6 +1954,14 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
     private fun handleVlmTaskFinished(source: String, taskId: String? = null) {
         mainJob.launch(Dispatchers.Main) {
             OmniLog.d(TAG, "收到 VLM 任务完成回调: source=$source")
+            TaskRuntimeSettings.onTaskFinished(context)
+            TaskRuntimeSettings.notifyTaskFinished(
+                context = context,
+                title = "小万任务已完成",
+                message = "任务已完成，点击查看详情",
+                conversationId = currentConversationId,
+                conversationMode = currentConversationMode
+            )
             navigateBackToChatIfNeeded()
             invokeFlutterEventSafely(
                 "onVLMTaskFinish",
@@ -1926,6 +2012,7 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
         }
         mainJob.launch {
             try {
+                TaskRuntimeSettings.onTaskStarted(context)
                 AssistsUtil.Core.createVLMOperationTask(
                     context,
                     call.argument<String>("goal")!!,
@@ -1940,10 +2027,12 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                     result.success("SUCCESS")
                 }
             } catch (e: PermissionException) {
+                TaskRuntimeSettings.onTaskFinished(context)
                 withContext(Dispatchers.Main) {
                     result.error("PERMISSION_ERROR", e.message, null)
                 }
             } catch (e: Exception) {
+                TaskRuntimeSettings.onTaskFinished(context)
                 withContext(Dispatchers.Main) {
                     result.error("DO_TASK_ERROR", e.message, null)
                 }
@@ -3731,6 +3820,27 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
         )
     }
 
+    private fun enrichScheduledSubagentParent(
+        arguments: Map<String, Any?>,
+        parentConversationId: Long?,
+        parentConversationMode: String
+    ): Map<String, Any?> {
+        val targetKind = arguments["targetKind"]?.toString()?.trim().orEmpty()
+        if (!targetKind.equals(SUBAGENT_MODE, ignoreCase = true) || parentConversationId == null) {
+            return arguments
+        }
+        if (
+            arguments["parentConversationId"] != null ||
+            arguments["subagentParentConversationId"] != null
+        ) {
+            return arguments
+        }
+        return LinkedHashMap(arguments).apply {
+            put("parentConversationId", parentConversationId)
+            put("parentConversationMode", parentConversationMode)
+        }
+    }
+
     private fun normalizeNotificationBody(text: String): String {
         val normalized = AgentTextSanitizer.sanitizeUtf16(text)
             .replace(Regex("\\s+"), " ")
@@ -3867,18 +3977,28 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
     }
 
     fun createAgentTask(call: MethodCall, result: MethodChannel.Result) {
+        val rawCallArguments = (call.arguments as? Map<*, *>)
+            ?.entries
+            ?.filter { it.key != null }
+            ?.associate { it.key.toString() to it.value }
+            ?: emptyMap()
         val taskId = (call.argument<String>("taskId") ?: "").trim()
         val userMessage = AgentTextSanitizer.sanitizeUtf16(
             (call.argument<String>("userMessage") ?: "").toString()
         )
         val legacyConversationHistory =
             call.argument<List<Map<String, Any?>>>("conversationHistory") ?: emptyList()
-        val attachments = (call.argument<List<Map<String, Any?>>>("attachments") ?: emptyList())
+        val rawAttachments = (call.argument<List<Map<String, Any?>>>("attachments") ?: emptyList())
             .map(::sanitizeInteropMap)
         AgentImageAttachmentSupport.workspaceManagerProvider = { AgentWorkspaceManager(context) }
-        val modelAttachments = AgentImageAttachmentSupport
-            .prepareAttachments(attachments)
-            .modelAttachments
+        val normalizedAttachments = AgentWorkspaceAttachmentSupport.prepareAttachmentsForRuntime(
+            context = context,
+            taskId = taskId,
+            rawAttachments = rawAttachments
+        )
+        val preparedAttachments = AgentImageAttachmentSupport.prepareAttachments(normalizedAttachments)
+        val runtimeAttachments = preparedAttachments.runtimeAttachments
+        val historyAttachments = preparedAttachments.historyAttachments
         val userMessageCreatedAt = call.argument<Number>("userMessageCreatedAt")?.toLong()
         val conversationId = call.argument<Number>("conversationId")?.toLong()?.takeIf { it > 0L }
         val requestedConversationMode =
@@ -3904,12 +4024,25 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
             result.error("INVALID_ARGUMENTS", "taskId is empty", null)
             return
         }
+        removeFailedAgentRetryContext(taskId)
         if (legacyConversationHistory.isNotEmpty()) {
             OmniLog.d(
                 TAG,
                 "Ignoring legacy conversationHistory for createAgentTask taskId=$taskId size=${legacyConversationHistory.size}"
             )
         }
+        val retryArguments = sanitizeInteropMap(
+            rawCallArguments + mapOf(
+                "taskId" to taskId,
+                "userMessage" to userMessage,
+                "attachments" to rawAttachments,
+                "userMessageCreatedAt" to userMessageCreatedAt,
+                "conversationId" to conversationId,
+                "conversationMode" to resolvedConversationMode,
+                "reasoningEffort" to reasoningEffort,
+                "terminalEnvironment" to terminalEnvironment
+            )
+        )
         val agentRunJob = SupervisorJob()
         val agentRunScope = CoroutineScope(agentRunJob + Dispatchers.Default)
         val agentRunContext = ActiveAgentRunContext(
@@ -3919,6 +4052,7 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
             conversationMode = resolvedConversationMode
         )
         registerActiveAgentRun(taskId, agentRunContext)
+        TaskRuntimeSettings.onTaskStarted(context)
 
         agentRunScope.launch {
             var historyRepository: AgentConversationHistoryRepository? = null
@@ -3931,8 +4065,13 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
 
                 val scheduleBridge = object : AgentScheduleToolBridge {
                     override suspend fun createTask(arguments: Map<String, Any?>): Map<String, Any?> {
+                        val enrichedArguments = enrichScheduledSubagentParent(
+                            arguments = arguments,
+                            parentConversationId = conversationId,
+                            parentConversationMode = resolvedConversationMode
+                        )
                         return toStringAnyMap(
-                            invokeFlutterMethodForAgent("agentScheduleCreate", arguments)
+                            invokeFlutterMethodForAgent("agentScheduleCreate", enrichedArguments)
                         )
                     }
 
@@ -3943,8 +4082,13 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                     }
 
                     override suspend fun updateTask(arguments: Map<String, Any?>): Map<String, Any?> {
+                        val enrichedArguments = enrichScheduledSubagentParent(
+                            arguments = arguments,
+                            parentConversationId = conversationId,
+                            parentConversationMode = resolvedConversationMode
+                        )
                         return toStringAnyMap(
-                            invokeFlutterMethodForAgent("agentScheduleUpdate", arguments)
+                            invokeFlutterMethodForAgent("agentScheduleUpdate", enrichedArguments)
                         )
                     }
 
@@ -4431,14 +4575,14 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                 }
 
                 conversationId?.let { normalizedConversationId ->
-                    if (userMessage.isNotBlank() || attachments.isNotEmpty()) {
+                    if (userMessage.isNotBlank() || historyAttachments.isNotEmpty()) {
                         persistConversationMutation("upsert user message") {
                             repository.upsertUserMessage(
                                 conversationId = normalizedConversationId,
                                 conversationMode = resolvedConversationMode,
                                 entryId = "$taskId-user",
                                 text = userMessage,
-                                attachments = attachments,
+                                attachments = historyAttachments,
                                 createdAt = userMessageCreatedAt ?: System.currentTimeMillis()
                             )
                         }
@@ -4729,6 +4873,7 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                     }
 
                     override suspend fun onComplete(result: AgentResult) {
+                        removeFailedAgentRetryContext(taskId)
                         val isSuccess = result is AgentResult.Success
                         val outputKind = (result as? AgentResult.Success)?.outputKind ?: "none"
                         val hasUserVisibleOutput =
@@ -4804,6 +4949,17 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                                 )
                             }
                         }
+                        if (scheduledSubagentMeta == null) {
+                            TaskRuntimeSettings.notifyTaskFinished(
+                                context = context,
+                                title = if (isSuccess) "Agent 任务已完成" else "Agent 任务已结束",
+                                message = finalText.ifBlank {
+                                    if (isSuccess) "任务已完成，点击查看详情" else "任务已结束，点击查看详情"
+                                },
+                                conversationId = conversationId ?: currentConversationId,
+                                conversationMode = resolvedConversationMode
+                            )
+                        }
                         sendStreamEvent(
                             kind = "completed",
                             entryId = completedEntryId,
@@ -4816,7 +4972,49 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                         )
                     }
 
+                    override suspend fun onRetrying(
+                        retryCount: Int,
+                        maxRetries: Int,
+                        retryDelayMs: Long,
+                        message: String,
+                        retryReason: String?
+                    ) {
+                        val retryEntryId = activeAssistantEntryId ?: activeThinkingEntryId
+                        val retryRoundIndex = if (activeAssistantEntryId != null) {
+                            assistantRound.coerceAtLeast(1)
+                        } else {
+                            thinkingRound.coerceAtLeast(1)
+                        }
+                        sendStreamEvent(
+                            kind = "retrying",
+                            entryId = retryEntryId,
+                            roundIndex = retryRoundIndex,
+                            text = AgentTextSanitizer.sanitizeUtf16(message).trim(),
+                            stage = 1,
+                            extras = mapOf(
+                                "willRetry" to true,
+                                "retryable" to true,
+                                "retryCount" to retryCount,
+                                "maxRetries" to maxRetries,
+                                "retryDelayMs" to retryDelayMs,
+                                "retryReason" to retryReason
+                            )
+                        )
+                    }
+
                     override suspend fun onError(error: String) {
+                        onError(error, retryable = false)
+                    }
+
+                    override suspend fun onError(error: String, retryable: Boolean) {
+                        if (retryable) {
+                            registerFailedAgentRetryContext(
+                                taskId,
+                                FailedAgentRetryContext(arguments = retryArguments)
+                            )
+                        } else {
+                            removeFailedAgentRetryContext(taskId)
+                        }
                         val resolution = resolveAgentFinalErrorResolution(
                             streamed = scheduledAssistantBuffer.toString().ifBlank {
                                 latestAssistantVisibleText
@@ -4827,6 +5025,12 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                                 "I can't generate a reply right now. Please try again."
                             )
                         )
+                        val errorText = AgentTextSanitizer.sanitizeUtf16(error).trim().ifEmpty {
+                            t(
+                                "暂时无法生成回复，请重试。",
+                                "I can't generate a reply right now. Please try again."
+                            )
+                        }
                         val finalText = resolution.text
                         finalizeThinkingCardIfNeeded(publish = finalText.isBlank())
                         var errorEntryId: String? = activeAssistantEntryId
@@ -4875,7 +5079,14 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                             entryId = errorEntryId,
                             roundIndex = errorRoundIndex,
                             error = error,
-                            extras = mapOf("persistAsError" to resolution.persistAsError)
+                            extras = mapOf(
+                                "persistAsError" to resolution.persistAsError,
+                                "willRetry" to false,
+                                "retryable" to retryable,
+                                "retryCount" to if (retryable) 3 else 0,
+                                "maxRetries" to 3,
+                                "errorText" to errorText
+                            )
                         )
                     }
 
@@ -5013,7 +5224,7 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                     legacyConversationHistory,
                     runtimeContextRepository,
                     currentPackageName,
-                    modelAttachments,
+                    runtimeAttachments,
                     conversationId,
                     resolvedConversationMode,
                     modelOverride,
@@ -5025,6 +5236,7 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
             } catch (e: CancellationException) {
                 OmniLog.i(TAG, "createAgentTask cancelled: ${e.message}")
             } catch (e: Exception) {
+                removeFailedAgentRetryContext(taskId)
                 OmniLog.e(TAG, "createAgentTask error: ${e.message}")
                 val errorMessage = e.message?.trim()?.takeIf { it.isNotEmpty() }?.let {
                     "Agent execution failed: $it"
@@ -5121,6 +5333,7 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
                     OmniLog.w(TAG, "dispatch agent startup failure failed: ${it.message}")
                 }
             } finally {
+                TaskRuntimeSettings.onTaskFinished(context)
                 clearActiveAgentJob(taskId, agentRunJob)
             }
         }
@@ -5702,13 +5915,21 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
         val title = call.argument<String>("title") ?: "新对话"
         val mode = normalizeConversationMode(call.argument<String>("mode"))
         val summary = call.argument<String>("summary")
+        val parentConversationId = call.argument<Number>("parentConversationId")
+            ?.toLong()
+            ?.takeIf { it > 0L }
+        val parentConversationMode = call.argument<String>("parentConversationMode")
+        val scheduledTaskId = call.argument<String>("scheduledTaskId")
 
         workJob.launch {
             try {
                 val conversation = conversationDomainService.createConversation(
                     title = title,
                     mode = mode,
-                    summary = summary
+                    summary = summary,
+                    parentConversationId = parentConversationId,
+                    parentConversationMode = parentConversationMode,
+                    scheduledTaskId = scheduledTaskId
                 )
                 withContext(Dispatchers.Main) {
                     result.success((conversation["id"] as? Number)?.toLong())
@@ -5919,6 +6140,86 @@ class AssistsCoreManager(private val context: Context) : OnMessagePushListener {
         } catch (e: Exception) {
             OmniLog.e(TAG, "保存自动返回聊天设置失败: ${e.message}")
             result.error("SAVE_AUTO_BACK_SETTING_FAILED", e.message, null)
+        }
+    }
+
+    fun setPreventScreenSleepDuringTasksEnabled(
+        call: MethodCall,
+        result: MethodChannel.Result
+    ) {
+        val enabled = call.argument<Boolean>("enabled") ?: true
+        try {
+            val success = TaskRuntimeSettings.setPreventSleepEnabled(context, enabled)
+            if (success) {
+                result.success("SUCCESS")
+            } else {
+                result.error("SAVE_PREVENT_SLEEP_SETTING_FAILED", "Failed to save prevent sleep setting", null)
+            }
+        } catch (e: Exception) {
+            OmniLog.e(TAG, "save prevent sleep setting failed: ${e.message}")
+            result.error("SAVE_PREVENT_SLEEP_SETTING_FAILED", e.message, null)
+        }
+    }
+
+    fun setTaskCompletionNotificationEnabled(
+        call: MethodCall,
+        result: MethodChannel.Result
+    ) {
+        val enabled = call.argument<Boolean>("enabled") ?: true
+        try {
+            val success = TaskRuntimeSettings.setTaskCompletionNotificationEnabled(context, enabled)
+            if (success) {
+                result.success("SUCCESS")
+            } else {
+                result.error("SAVE_TASK_NOTIFICATION_SETTING_FAILED", "Failed to save task notification setting", null)
+            }
+        } catch (e: Exception) {
+            OmniLog.e(TAG, "save task notification setting failed: ${e.message}")
+            result.error("SAVE_TASK_NOTIFICATION_SETTING_FAILED", e.message, null)
+        }
+    }
+
+    fun showTaskCompletionNotification(
+        call: MethodCall,
+        result: MethodChannel.Result
+    ) {
+        try {
+            val title = call.argument<String>("title") ?: "Task completed"
+            val message = call.argument<String>("message") ?: "Tap to view details."
+            val conversationId = when (val raw = call.argument<Any>("conversationId")) {
+                is Number -> raw.toLong()
+                is String -> raw.toLongOrNull()
+                else -> null
+            }
+            val conversationMode = call.argument<String>("conversationMode")
+            TaskRuntimeSettings.notifyTaskFinished(
+                context = context,
+                title = title,
+                message = message,
+                conversationId = conversationId,
+                conversationMode = conversationMode
+            )
+            result.success("SUCCESS")
+        } catch (e: Exception) {
+            OmniLog.e(TAG, "show task completion notification failed: ${e.message}")
+            result.error("SHOW_TASK_NOTIFICATION_FAILED", e.message, null)
+        }
+    }
+
+    fun setVisibleChatConversation(
+        call: MethodCall,
+        result: MethodChannel.Result
+    ) {
+        val visible = call.argument<Boolean>("visible") ?: true
+        val conversationId = when (val raw = call.argument<Any>("conversationId")) {
+            is Number -> raw.toLong()
+            is String -> raw.toLongOrNull()
+            else -> null
+        }?.takeIf { it > 0 }
+        val mode = (call.argument<String>("mode") ?: "normal").trim().ifEmpty { "normal" }
+        TaskRuntimeSettings.setVisibleConversation(context, conversationId, mode, visible)
+        mainJob.launch(Dispatchers.Main) {
+            result.success("SUCCESS")
         }
     }
 

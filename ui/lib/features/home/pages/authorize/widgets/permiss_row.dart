@@ -125,9 +125,12 @@ class PermissionRow extends StatelessWidget {
                     Text(
                       permissionDescription,
                       style: TextStyle(
-                        color: isDark
-                            ? palette.textSecondary
-                            : const Color(0xFF9FB0BA),
+                        // 浅色模式下原来写死 #9FB0BA,那是为白底实色卡片设计
+                        // 的浅灰蓝;放到陪伴权限弹窗的玻璃面板上(背景半透,
+                        // 透出页面浅色调)对比度严重不足,"桌面悬浮显示……"
+                        // 这类描述文字基本看不清。这里直接走 palette token,
+                        // 浅色 textSecondary = #71809B,玻璃上也能读清。
+                        color: palette.textSecondary,
                         fontSize: 12,
                         fontFamily: 'PingFang SC',
                         fontWeight: FontWeight.w400,

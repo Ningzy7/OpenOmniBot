@@ -1,10 +1,16 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:ui/features/home/pages/chat/tool_activity_utils.dart';
+import 'package:ui/features/home/pages/command_overlay/widgets/cards/codex_diff_viewer.dart';
 import 'package:ui/features/home/pages/command_overlay/widgets/cards/terminal_output_utils.dart';
+import 'package:ui/services/chat_detail_sheet_preferences.dart';
+import 'package:ui/services/codex_diff_parser.dart';
 import 'package:ui/theme/app_colors.dart';
+import 'package:ui/widgets/omni_glass.dart';
 
 const Color _kTimeoutStatusColor = Color(0xFFFF8A3D);
 const Color _kInterruptedStatusColor = Color(0xFFFFC04D);
@@ -132,39 +138,51 @@ Color resolveAgentToolStatusColor(String status) {
 
 IconData resolveAgentToolStatusIcon(String status, String toolType) {
   if (status == 'timeout') {
-    return Icons.hourglass_top_rounded;
+    return LucideIcons.hourglass;
   }
   if (status == 'interrupted') {
-    return Icons.stop_circle_outlined;
+    return LucideIcons.stopCircle;
   }
   if (status == 'error') {
-    return Icons.error_outline_rounded;
+    return LucideIcons.triangleAlert;
   }
   if (toolType == 'terminal') {
-    return Icons.terminal_rounded;
+    return LucideIcons.squareTerminal;
   }
   if (toolType == 'browser') {
-    return Icons.language_rounded;
+    return LucideIcons.globe;
+  }
+  if (toolType == 'search') {
+    return LucideIcons.search;
+  }
+  if (toolType == 'image') {
+    return LucideIcons.image;
+  }
+  if (toolType == 'file') {
+    return LucideIcons.filePenLine;
   }
   if (toolType == 'calendar') {
-    return Icons.calendar_month_rounded;
+    return LucideIcons.calendarDays;
   }
   if (toolType == 'alarm' || toolType == 'schedule') {
-    return Icons.alarm_rounded;
+    return LucideIcons.alarmClock;
   }
   if (toolType == 'memory') {
-    return Icons.psychology_alt_rounded;
+    return LucideIcons.brain;
   }
   if (toolType == 'workspace') {
-    return Icons.folder_outlined;
+    return LucideIcons.folder;
   }
   if (toolType == 'subagent') {
-    return Icons.hub_outlined;
+    return LucideIcons.network;
+  }
+  if (toolType == 'review') {
+    return LucideIcons.messageSquare;
   }
   if (toolType == 'mcp') {
-    return Icons.extension_outlined;
+    return LucideIcons.puzzle;
   }
-  return Icons.check_circle_outline_rounded;
+  return LucideIcons.circleCheck;
 }
 
 TextSpan _buildDetailTextSpan(AgentToolTranscript transcript) {
@@ -773,12 +791,34 @@ class _AgentToolDetailSheetFrameState
     setState(() {
       final current =
           _heightFactor ??
-          _initialHeightFactor(MediaQuery.sizeOf(context).height);
+          ChatDetailSheetPreferences.resolveHeightFactor(
+            fallback: _initialHeightFactor(MediaQuery.sizeOf(context).height),
+            min: _minHeightFactor,
+            max: _maxHeightFactor,
+          );
       _heightFactor = (current - delta / availableHeight).clamp(
         _minHeightFactor,
         _maxHeightFactor,
       );
     });
+  }
+
+  void _persistHeightFactor() {
+    final heightFactor = _heightFactor;
+    if (heightFactor == null) {
+      return;
+    }
+    try {
+      unawaited(
+        ChatDetailSheetPreferences.saveHeightFactor(
+          heightFactor,
+          min: _minHeightFactor,
+          max: _maxHeightFactor,
+        ).catchError((_) {}),
+      );
+    } catch (_) {
+      // Storage may not be initialized in tests or cold-start edge cases.
+    }
   }
 
   @override
@@ -791,7 +831,7 @@ class _AgentToolDetailSheetFrameState
           mediaQuery.viewInsets.bottom,
     );
     final heightFactor =
-        _heightFactor ?? _initialHeightFactor(mediaQuery.size.height);
+        _heightFactor ?? _resolveStoredHeightFactor(mediaQuery.size.height);
     const borderRadius = BorderRadius.vertical(top: Radius.circular(24));
 
     return SafeArea(
@@ -800,62 +840,61 @@ class _AgentToolDetailSheetFrameState
         duration: const Duration(milliseconds: 180),
         curve: Curves.easeOutCubic,
         padding: EdgeInsets.only(bottom: mediaQuery.viewInsets.bottom),
-        child: SizedBox(
+        child: OmniGlassPanel(
           key: kAgentToolDetailSheetKey,
           height: availableHeight * heightFactor,
           width: double.infinity,
-          child: DecoratedBox(
-            decoration: const BoxDecoration(
-              color: kTerminalSurfaceBlack,
-              borderRadius: borderRadius,
-              boxShadow: [
-                BoxShadow(
-                  color: kTerminalSurfaceShadow,
-                  blurRadius: 32,
-                  offset: Offset(0, -8),
-                ),
-              ],
-            ),
-            child: ClipRRect(
-              borderRadius: borderRadius,
-              child: Material(
-                color: kTerminalSurfaceBlack,
-                child: Column(
-                  children: [
-                    GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onVerticalDragUpdate: (details) =>
-                          _handleDragUpdate(details, availableHeight),
-                      child: SizedBox(
-                        height: 22,
-                        width: double.infinity,
-                        child: Center(
-                          child: Container(
-                            width: 42,
-                            height: 4,
-                            decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.24),
-                              borderRadius: BorderRadius.circular(999),
-                            ),
-                          ),
+          borderRadius: borderRadius,
+          forceDark: true,
+          child: Material(
+            color: Colors.transparent,
+            child: Column(
+              children: [
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onVerticalDragUpdate: (details) =>
+                      _handleDragUpdate(details, availableHeight),
+                  onVerticalDragEnd: (_) => _persistHeightFactor(),
+                  child: SizedBox(
+                    height: 22,
+                    width: double.infinity,
+                    child: Center(
+                      child: Container(
+                        width: 42,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.34),
+                          borderRadius: BorderRadius.circular(999),
                         ),
                       ),
                     ),
-                    Expanded(
-                      child: _AgentToolDetailContent(
-                        cardData: widget.cardData,
-                        headerPadding: const EdgeInsets.fromLTRB(18, 0, 18, 10),
-                        scrollPadding: const EdgeInsets.fromLTRB(18, 0, 18, 16),
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
-              ),
+                Expanded(
+                  child: _AgentToolDetailContent(
+                    cardData: widget.cardData,
+                    headerPadding: const EdgeInsets.fromLTRB(18, 0, 18, 10),
+                    scrollPadding: const EdgeInsets.fromLTRB(18, 0, 18, 16),
+                  ),
+                ),
+              ],
             ),
           ),
         ),
       ),
     );
+  }
+
+  double _resolveStoredHeightFactor(double viewportHeight) {
+    try {
+      return ChatDetailSheetPreferences.resolveHeightFactor(
+        fallback: _initialHeightFactor(viewportHeight),
+        min: _minHeightFactor,
+        max: _maxHeightFactor,
+      );
+    } catch (_) {
+      return _initialHeightFactor(viewportHeight);
+    }
   }
 }
 
@@ -882,7 +921,9 @@ class _AgentToolDetailContent extends StatelessWidget {
     final typeLabel = resolveAgentToolTypeLabel(cardData);
     final status = (cardData['status'] ?? 'running').toString();
     final statusLabel = resolveAgentToolStatusLabel(cardData);
-    final detailSpan = _buildDetailTextSpan(transcript);
+    final diffSummary = _resolveDiffSummary(cardData);
+    final isDiffView = diffSummary?.files.isNotEmpty == true;
+    final detailSpan = isDiffView ? null : _buildDetailTextSpan(transcript);
 
     return Column(
       children: [
@@ -912,14 +953,36 @@ class _AgentToolDetailContent extends StatelessWidget {
           ),
         ),
         Expanded(
-          child: SingleChildScrollView(
-            padding: scrollPadding,
-            child: SelectableText.rich(detailSpan),
-          ),
+          child: isDiffView
+              ? CodexDiffViewer(summary: diffSummary!, padding: scrollPadding)
+              : SingleChildScrollView(
+                  padding: scrollPadding,
+                  child: SelectableText.rich(detailSpan!),
+                ),
         ),
       ],
     );
   }
+}
+
+CodexDiffSummary? _resolveDiffSummary(Map<String, dynamic> cardData) {
+  final diffText = (cardData['diffText'] ?? '').toString();
+  final extracted = extractCodexDiffText(
+    <String, dynamic>{
+      ...cardData,
+      if (diffText.isNotEmpty) 'diffText': diffText,
+    },
+    outputText: diffText.isNotEmpty
+        ? diffText
+        : resolveAgentToolTerminalOutput(cardData),
+    progress: (cardData['progress'] ?? '').toString(),
+    summary: (cardData['summary'] ?? '').toString(),
+  );
+  if (extracted == null || extracted.trim().isEmpty) {
+    return null;
+  }
+  final summary = parseCodexDiffText(extracted);
+  return summary.files.isEmpty ? null : summary;
 }
 
 class _DialogMetaTag extends StatelessWidget {

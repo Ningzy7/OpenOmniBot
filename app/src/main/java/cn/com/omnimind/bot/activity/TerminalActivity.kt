@@ -66,7 +66,7 @@ class TerminalActivity : ComponentActivity() {
         }
 
         val initHostPath = File(filesDir.parentFile, "local/bin/init-host").absolutePath
-        val installScriptPath = prepareSetupScript(commands)
+        val installScriptPath = prepareSetupScript(commands, selectedPackageIds)
 
         pendingCommand = TerminalCommand(
             shell = ShellArgv.SYSTEM_SH,
@@ -82,11 +82,11 @@ class TerminalActivity : ComponentActivity() {
         )
     }
 
-    private fun prepareSetupScript(commands: List<String>): String {
+    private fun prepareSetupScript(commands: List<String>, selectedPackageIds: List<String>): String {
         val scriptFile = File(filesDir.parentFile, "local/bin/omni-setup.sh").apply {
             parentFile?.mkdirs()
         }
-        val content = EnvironmentSetupLogic.buildSetupScript(commands)
+        val content = EnvironmentSetupLogic.buildSetupScript(commands, selectedPackageIds)
         scriptFile.writeText(content)
         scriptFile.setExecutable(true, false)
         return scriptFile.absolutePath

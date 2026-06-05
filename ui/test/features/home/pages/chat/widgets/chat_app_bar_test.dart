@@ -1001,6 +1001,36 @@ void main() {
     expect(codexTapCount, 1);
   });
 
+  testWidgets('hides update indicator when no update is available', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: DefaultAssetBundle(
+          bundle: _SvgTestAssetBundle(),
+          child: Scaffold(
+            body: ChatAppBar(
+              onMenuTap: () {},
+              onCompanionTap: () {},
+              activeMode: ChatSurfaceMode.normal,
+              onModeChanged: (_) {},
+              activeModelId: 'gpt-5.4',
+              displayLayer: ChatIslandDisplayLayer.model,
+              onDisplayLayerChanged: (_) {},
+              onTerminalEnvironmentTap: (_) {},
+              onTerminalTap: () {},
+              onBrowserTap: () {},
+              showAppUpdateIndicator: false,
+              onAppUpdateTap: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byKey(const ValueKey('chat-app-update-button')), findsNothing);
+  });
+
   testWidgets('tints and enlarges codex icon with theme color when selected', (
     tester,
   ) async {

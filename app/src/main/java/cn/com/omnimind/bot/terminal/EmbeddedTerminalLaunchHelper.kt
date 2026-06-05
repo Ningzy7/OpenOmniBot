@@ -58,7 +58,7 @@ object EmbeddedTerminalLaunchHelper {
             return
         }
 
-        val installScriptPath = prepareSetupScript(context, commands)
+        val installScriptPath = prepareSetupScript(context, commands, selectedPackageIds)
         val initHostPath = File(context.filesDir.parentFile, "local/bin/init-host").absolutePath
 
         pendingCommand = TerminalCommand(
@@ -79,11 +79,15 @@ object EmbeddedTerminalLaunchHelper {
         )
     }
 
-    private fun prepareSetupScript(context: Context, commands: List<String>): String {
+    private fun prepareSetupScript(
+        context: Context,
+        commands: List<String>,
+        selectedPackageIds: List<String>
+    ): String {
         val scriptFile = File(context.filesDir.parentFile, "local/bin/omni-setup.sh").apply {
             parentFile?.mkdirs()
         }
-        val content = EnvironmentSetupLogic.buildSetupScript(commands)
+        val content = EnvironmentSetupLogic.buildSetupScript(commands, selectedPackageIds)
         scriptFile.writeText(content)
         scriptFile.setExecutable(true, false)
         return scriptFile.absolutePath

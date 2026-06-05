@@ -168,6 +168,22 @@ void main() {
     expect(restored, target);
   });
 
+  test('round-trips remote codex active thread target metadata', () {
+    const target = ConversationThreadTarget.codexSession(
+      threadId: 'thread-active',
+      runtime: 'remote',
+      codexThreadActive: true,
+      requestKey: 'request-1',
+    );
+
+    final restored = ConversationThreadTarget.fromEncodedJson(
+      target.toEncodedJson(),
+    );
+
+    expect(restored, target);
+    expect(restored.codexThreadActive, isTrue);
+  });
+
   test(
     'falls back to current thread target when last visible is absent',
     () async {

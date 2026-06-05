@@ -21,6 +21,7 @@ import cn.com.omnimind.bot.termux.TermuxCommandRunner
 import cn.com.omnimind.bot.util.AssistsUtil
 import cn.com.omnimind.bot.workspace.PublicStorageAccess
 import cn.com.omnimind.bot.workspace.WorkspaceStorageAccess
+import com.rk.libcommons.OmnibotTerminalEnvironment
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.CoroutineScope
@@ -510,9 +511,10 @@ class SpecialPermissionManager(private val context: Context) {
             } catch (e: Exception) {
                 OmniLog.e(TAG, "Error reading embedded terminal setup inventory", e)
                 withContext(Dispatchers.Main) {
+                    val message = e.message ?: "Failed to read embedded terminal setup inventory."
                     result.error(
                         "READ_SETUP_INVENTORY_FAILED",
-                        "Failed to read embedded terminal setup inventory.",
+                        message,
                         e.message
                     )
                 }
@@ -682,6 +684,40 @@ class SpecialPermissionManager(private val context: Context) {
                     result.error(
                         "RUN_AUTO_START_TASK_FAILED",
                         "Failed to run embedded terminal auto-start task.",
+                        e.message
+                    )
+                }
+            }
+        }
+    }
+
+    fun syncTerminalEnvironmentVariables(call: MethodCall, result: MethodChannel.Result) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val rawVariables = call.argument<List<Any?>>("variables").orEmpty()
+                val variables = linkedMapOf<String, String>()
+                rawVariables.forEach { item ->
+                    val map = item as? Map<*, *> ?: return@forEach
+                    val key = map["key"]?.toString().orEmpty()
+                    val value = map["value"]?.toString().orEmpty()
+                    variables[key] = value
+                }
+                val normalized = OmnibotTerminalEnvironment.saveUserVariables(context, variables)
+                withContext(Dispatchers.Main) {
+                    result.success(
+                        mapOf(
+                            "variables" to normalized.map { (key, value) ->
+                                mapOf("key" to key, "value" to value)
+                            }
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                OmniLog.e(TAG, "Error syncing terminal environment variables", e)
+                withContext(Dispatchers.Main) {
+                    result.error(
+                        "SYNC_TERMINAL_ENV_FAILED",
+                        "Failed to sync terminal environment variables.",
                         e.message
                     )
                 }

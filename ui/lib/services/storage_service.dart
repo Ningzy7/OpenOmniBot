@@ -3,6 +3,7 @@ import 'dart:ui';
 
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:ui/l10n/app_language_mode.dart';
+import 'package:ui/models/chat_startup_behavior.dart';
 import 'package:ui/models/habitual_hand.dart';
 import 'package:ui/theme/app_theme_mode.dart';
 
@@ -152,8 +153,16 @@ class StorageService {
 
   static const String kAutoBackToChatAfterTaskKey =
       'auto_back_to_chat_after_task';
+  static const String kPreventScreenSleepDuringTasksKey =
+      'prevent_screen_sleep_during_tasks';
+  static const String kTaskCompletionNotificationEnabledKey =
+      'task_completion_notification_enabled';
+  static const String kPetOverlayImagePathKey = 'pet_overlay_image_path';
+  static const String kPetOverlaySelectedIdKey = 'pet_overlay_selected_id';
+  static const String kPetOverlayVisibleKey = 'pet_overlay_visible';
   static const String kUseIndependentChatSendButtonKey =
       'use_independent_chat_send_button';
+  static const String kChatStartupBehaviorKey = 'chat_startup_behavior';
   static const String kHabitualHandKey = 'habitual_hand';
   static const String kThemeOptionKey = 'theme_option';
   static const String kLanguageOptionKey = 'language_option';
@@ -165,18 +174,16 @@ class StorageService {
     String modelId,
     int threshold,
   ) async {
-    final map = getJson<Map<String, dynamic>>(
-          _kManualModelContextThresholdsKey,
-        ) ??
+    final map =
+        getJson<Map<String, dynamic>>(_kManualModelContextThresholdsKey) ??
         <String, dynamic>{};
     map[modelId] = threshold;
     return setJson(_kManualModelContextThresholdsKey, map);
   }
 
   static Future<bool> clearManualModelContextThreshold(String modelId) async {
-    final map = getJson<Map<String, dynamic>>(
-          _kManualModelContextThresholdsKey,
-        ) ??
+    final map =
+        getJson<Map<String, dynamic>>(_kManualModelContextThresholdsKey) ??
         <String, dynamic>{};
     if (!map.containsKey(modelId)) return true;
     map.remove(modelId);
@@ -203,6 +210,60 @@ class StorageService {
     await setBool(kAutoBackToChatAfterTaskKey, enabled);
   }
 
+  static Future<bool> isPreventScreenSleepDuringTasksEnabled() async {
+    final enabled = getBool(
+      kPreventScreenSleepDuringTasksKey,
+      defaultValue: true,
+    );
+    return enabled ?? true;
+  }
+
+  static Future<void> setPreventScreenSleepDuringTasksEnabled(
+    bool enabled,
+  ) async {
+    await setBool(kPreventScreenSleepDuringTasksKey, enabled);
+  }
+
+  static Future<bool> isTaskCompletionNotificationEnabled() async {
+    final enabled = getBool(
+      kTaskCompletionNotificationEnabledKey,
+      defaultValue: true,
+    );
+    return enabled ?? true;
+  }
+
+  static Future<void> setTaskCompletionNotificationEnabled(bool enabled) async {
+    await setBool(kTaskCompletionNotificationEnabledKey, enabled);
+  }
+
+  static String getPetOverlayImagePath() {
+    return getString(kPetOverlayImagePathKey, defaultValue: '') ?? '';
+  }
+
+  static Future<void> setPetOverlayImagePath(String path) async {
+    await setString(kPetOverlayImagePathKey, path);
+  }
+
+  static String getPetOverlaySelectedId() {
+    return getString(
+          kPetOverlaySelectedIdKey,
+          defaultValue: 'builtin:xiaowan',
+        ) ??
+        'builtin:xiaowan';
+  }
+
+  static Future<void> setPetOverlaySelectedId(String id) async {
+    await setString(kPetOverlaySelectedIdKey, id);
+  }
+
+  static bool isPetOverlayVisible() {
+    return getBool(kPetOverlayVisibleKey, defaultValue: false) ?? false;
+  }
+
+  static Future<void> setPetOverlayVisible(bool visible) async {
+    await setBool(kPetOverlayVisibleKey, visible);
+  }
+
   static bool isIndependentChatSendButtonEnabled() {
     return getBool(kUseIndependentChatSendButtonKey, defaultValue: true) ??
         true;
@@ -210,6 +271,19 @@ class StorageService {
 
   static Future<bool> setIndependentChatSendButtonEnabled(bool enabled) {
     return setBool(kUseIndependentChatSendButtonKey, enabled);
+  }
+
+  static ChatStartupBehavior getChatStartupBehavior() {
+    return ChatStartupBehavior.fromStorageValue(
+      getString(
+        kChatStartupBehaviorKey,
+        defaultValue: ChatStartupBehavior.resumeLast.storageValue,
+      ),
+    );
+  }
+
+  static Future<bool> setChatStartupBehavior(ChatStartupBehavior behavior) {
+    return setString(kChatStartupBehaviorKey, behavior.storageValue);
   }
 
   static HabitualHand getHabitualHand() {

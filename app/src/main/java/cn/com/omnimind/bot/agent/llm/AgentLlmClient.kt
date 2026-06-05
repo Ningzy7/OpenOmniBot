@@ -34,9 +34,56 @@ interface AgentLlmClient {
     ): ChatCompletionTurn
 }
 
+class AgentStreamRequestException(
+    val statusCode: Int?,
+    val reason: String,
+    val responseBody: String?
+) : RuntimeException(
+    "chat completion stream request failed${
+        statusCode?.let { "($it)" }.orEmpty()
+    }: $reason"
+)
+
 class HttpAgentLlmClient(
     private val scope: CoroutineScope,
     private val modelOverride: AgentModelOverride? = null,
+    private val streamRequestOp: suspend (
+        model: String,
+        requestBodyJson: String,
+        event: EventSourceListener,
+        explicitApiBase: String?,
+        explicitApiKey: String?,
+        explicitModel: String?,
+        explicitProtocolType: String?,
+        forceHttp1: Boolean
+    ) -> EventSource = { model, requestBodyJson, event, explicitApiBase, explicitApiKey, explicitModel, explicitProtocolType, forceHttp1 ->
+        HttpController.postChatCompletionsStreamRequest(
+            model = model,
+            requestBodyJson = requestBodyJson,
+            event = event,
+            explicitApiBase = explicitApiBase,
+            explicitApiKey = explicitApiKey,
+            explicitModel = explicitModel,
+            explicitProtocolType = explicitProtocolType,
+            forceHttp1 = forceHttp1
+        )
+    },
+    private val resolveRouteInfoOp: (
+        modelOrScene: String,
+        explicitApiBase: String?,
+        explicitApiKey: String?,
+        explicitModel: String?,
+        explicitProtocolType: String?
+    ) -> HttpController.ChatCompletionRouteInfo = { modelOrScene, explicitApiBase, explicitApiKey, explicitModel, explicitProtocolType ->
+        HttpController.resolveChatCompletionRouteInfo(
+            modelOrScene = modelOrScene,
+            explicitApiBase = explicitApiBase,
+            explicitApiKey = explicitApiKey,
+            explicitModel = explicitModel,
+            explicitProtocolType = explicitProtocolType
+        )
+    },
+    private val streamIdleWatchdogMs: Long = 0L,
     private val json: Json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -49,21 +96,13 @@ class HttpAgentLlmClient(
     private companion object {
         const val REASONING_UPDATE_INTERVAL_MS =
             ReasoningStreamUpdatePolicy.DEFAULT_INTERVAL_MS
+        const val DEFAULT_CLOSED_STREAM_ERROR =
+            "chat completion stream closed before completion signal"
     }
 
     private data class StreamRequestVariant(
         val name: String,
         val requestJson: String
-    )
-
-    private class StreamRequestFailure(
-        val statusCode: Int?,
-        val reason: String,
-        val responseBody: String?
-    ) : RuntimeException(
-        "chat completion stream request failed${
-            statusCode?.let { "($it)" }.orEmpty()
-        }: $reason"
     )
 
     override suspend fun streamTurn(
@@ -75,7 +114,7 @@ class HttpAgentLlmClient(
         val variants = buildRequestVariants(
             sanitizeRequestForTarget(request)
         )
-        var lastFailure: StreamRequestFailure? = null
+        var lastFailure: AgentStreamRequestException? = null
 
         for (modelIndex in modelCandidates.indices) {
             val candidateModel = modelCandidates[modelIndex]
@@ -94,7 +133,7 @@ class HttpAgentLlmClient(
                         onReasoningUpdate = onReasoningUpdate,
                         onContentUpdate = onContentUpdate
                     )
-                } catch (error: StreamRequestFailure) {
+                } catch (error: AgentStreamRequestException) {
                     lastFailure = error
                     val canRetryVariant =
                         error.statusCode == 400 && variantIndex < variants.lastIndex
@@ -132,7 +171,7 @@ class HttpAgentLlmClient(
     ): ChatCompletionTurn {
         return try {
             doStreamTurnOnce(model, requestJson, onReasoningUpdate, onContentUpdate, forceHttp1 = false)
-        } catch (e: StreamRequestFailure) {
+        } catch (e: AgentStreamRequestException) {
             if (isHttp2ProtocolError(e)) {
                 OmniLog.w(tag, "HTTP/2 stream PROTOCOL_ERROR, retrying with HTTP/1.1")
                 doStreamTurnOnce(model, requestJson, onReasoningUpdate, onContentUpdate, forceHttp1 = true)
@@ -142,9 +181,27 @@ class HttpAgentLlmClient(
         }
     }
 
-    private fun isHttp2ProtocolError(error: StreamRequestFailure): Boolean {
+    private fun isHttp2ProtocolError(error: AgentStreamRequestException): Boolean {
         return error.reason.contains("PROTOCOL_ERROR", ignoreCase = true)
                 || error.reason.contains("stream was reset", ignoreCase = true)
+    }
+
+    private fun shouldBufferLeadingInlineThinkTag(
+        routeInfo: HttpController.ChatCompletionRouteInfo
+    ): Boolean {
+        val protocolType = routeInfo.protocolType.trim().ifEmpty { "openai_compatible" }
+        if (!protocolType.equals("openai_compatible", ignoreCase = true)) {
+            return false
+        }
+        return sequenceOf(routeInfo.resolvedModel, routeInfo.requestedModel)
+            .map { it.trim().lowercase() }
+            .any { model ->
+                model.startsWith("qwen") ||
+                    model.contains("/qwen") ||
+                    model.contains(":qwen") ||
+                    model.contains("_qwen") ||
+                    model.contains("-qwen")
+            }
     }
 
     private suspend fun doStreamTurnOnce(
@@ -156,12 +213,12 @@ class HttpAgentLlmClient(
     ): ChatCompletionTurn {
         val streamDone = CompletableDeferred<ChatCompletionTurn>()
         val completed = AtomicBoolean(false)
-        val routeInfo = HttpController.resolveChatCompletionRouteInfo(
-            modelOrScene = model,
-            explicitApiBase = modelOverride?.apiBase,
-            explicitApiKey = modelOverride?.apiKey,
-            explicitModel = modelOverride?.modelId,
-            explicitProtocolType = modelOverride?.protocolType
+        val routeInfo = resolveRouteInfoOp(
+            model,
+            modelOverride?.apiBase,
+            modelOverride?.apiKey,
+            modelOverride?.modelId,
+            modelOverride?.protocolType
         )
         val accumulator = AgentLlmStreamAccumulator(
             json = json,
@@ -169,7 +226,8 @@ class HttpAgentLlmClient(
                 modelOverride?.providerProfileId,
                 modelOverride?.apiBase
             ),
-            includeReasoningInAssistantMessage = routeInfo?.requiresReasoningEcho == true
+            includeReasoningInAssistantMessage = routeInfo.requiresReasoningEcho,
+            bufferLeadingTextUntilInlineThinkTag = shouldBufferLeadingInlineThinkTag(routeInfo)
         )
         var lastReasoning = ""
         var lastReasoningEmitLength = 0
@@ -178,6 +236,7 @@ class HttpAgentLlmClient(
         val reasoningLock = Any()
         var lastContent = ""
         var eventSource: EventSource? = null
+        var streamIdleWatchdog: Job? = null
         val emissionQueue = Channel<suspend () -> Unit>(Channel.UNLIMITED)
         val emissionJob = scope.launch {
             for (block in emissionQueue) {
@@ -192,6 +251,29 @@ class HttpAgentLlmClient(
                 return
             }
             emissionQueue.trySend(block)
+        }
+
+        fun cancelWatchdog() {
+            streamIdleWatchdog?.cancel()
+            streamIdleWatchdog = null
+        }
+
+        fun scheduleWatchdog() {
+            val timeoutMs = streamIdleWatchdogMs
+            if (timeoutMs <= 0L) {
+                return
+            }
+            cancelWatchdog()
+            streamIdleWatchdog = scope.launch {
+                delay(timeoutMs)
+                if (!completed.compareAndSet(false, true)) {
+                    return@launch
+                }
+                streamDone.completeExceptionally(
+                    IllegalStateException("chat completion stream idle timeout after ${timeoutMs}ms")
+                )
+                eventSource?.cancel()
+            }
         }
 
         fun dispatchReasoningSnapshot(reasoning: String) {
@@ -273,6 +355,7 @@ class HttpAgentLlmClient(
 
         fun completeStream(eventSource: EventSource? = null) {
             if (!completed.compareAndSet(false, true)) return
+            cancelWatchdog()
             runCatching {
                 val turn = accumulator.buildTurn()
                 enforceReasoningEchoIfRequired(turn, routeInfo)
@@ -288,6 +371,10 @@ class HttpAgentLlmClient(
         }
 
         val listener = object : EventSourceListener() {
+            override fun onOpen(eventSource: EventSource, response: Response) {
+                scheduleWatchdog()
+            }
+
             override fun onEvent(
                 eventSource: EventSource,
                 id: String?,
@@ -296,6 +383,7 @@ class HttpAgentLlmClient(
             ) {
                 if (completed.get()) return
                 runCatching {
+                    scheduleWatchdog()
                     val done = accumulator.consume(data)
                     emitReasoning()
                     emitContent()
@@ -312,17 +400,31 @@ class HttpAgentLlmClient(
             }
 
             override fun onClosed(eventSource: EventSource) {
-                completeStream()
+                if (completed.get()) {
+                    cancelWatchdog()
+                    return
+                }
+                if (accumulator.canFinalizeOnClosed()) {
+                    completeStream()
+                    return
+                }
+                cancelWatchdog()
+                if (completed.compareAndSet(false, true)) {
+                    streamDone.completeExceptionally(
+                        IllegalStateException(DEFAULT_CLOSED_STREAM_ERROR)
+                    )
+                }
             }
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
                 if (!completed.compareAndSet(false, true)) return
+                cancelWatchdog()
                 val responseBody = extractResponseBody(response)
                 val reason = extractErrorReason(responseBody)
                     ?: sanitizeReason(t?.message)
                     ?: "unknown stream failure"
                 streamDone.completeExceptionally(
-                    StreamRequestFailure(
+                    AgentStreamRequestException(
                         statusCode = response?.code,
                         reason = reason,
                         responseBody = responseBody
@@ -332,18 +434,20 @@ class HttpAgentLlmClient(
         }
 
         try {
-            eventSource = HttpController.postChatCompletionsStreamRequest(
-                model = model,
-                requestBodyJson = requestJson,
-                event = listener,
-                explicitApiBase = modelOverride?.apiBase,
-                explicitApiKey = modelOverride?.apiKey,
-                explicitModel = modelOverride?.modelId,
-                explicitProtocolType = modelOverride?.protocolType,
-                forceHttp1 = forceHttp1
+            eventSource = streamRequestOp(
+                model,
+                requestJson,
+                listener,
+                modelOverride?.apiBase,
+                modelOverride?.apiKey,
+                modelOverride?.modelId,
+                modelOverride?.protocolType,
+                forceHttp1
             )
+            scheduleWatchdog()
             return streamDone.await()
         } finally {
+            cancelWatchdog()
             reasoningEmitJob?.cancel()
             eventSource?.cancel()
             emissionQueue.close()
@@ -559,7 +663,7 @@ class HttpAgentLlmClient(
         return candidates.toList()
     }
 
-    private fun isModelNotSupported(error: StreamRequestFailure): Boolean {
+    private fun isModelNotSupported(error: AgentStreamRequestException): Boolean {
         val code = error.statusCode
         if (code != 400 && code != 404) return false
         val haystack = buildString {

@@ -33,6 +33,8 @@ import 'package:ui/services/app_background_service.dart';
 import 'package:ui/services/agent_browser_session_service.dart';
 import 'package:ui/services/chat_terminal_environment_service.dart';
 import 'package:ui/services/codex_app_server_service.dart';
+import 'package:ui/services/codex_diff_parser.dart';
+import 'package:ui/services/codex_tool_call_parser.dart';
 import 'package:ui/services/conversation_model_override_service.dart';
 import 'package:ui/services/conversation_history_service.dart';
 import 'package:ui/services/conversation_service.dart';
@@ -48,15 +50,17 @@ import 'package:ui/services/shared_open_draft_service.dart';
 import 'package:ui/features/local_model/local_model_feature.dart';
 import 'package:ui/theme/theme_context.dart';
 import 'package:ui/services/special_permission.dart';
-import 'package:ui/utils/popup_menu_anchor_position.dart';
 import 'package:ui/services/storage_service.dart';
 import 'package:ui/utils/ui.dart';
 import 'package:ui/l10n/legacy_text_localizer.dart';
+import 'package:ui/models/chat_startup_behavior.dart';
 import 'package:ui/features/home/pages/chat/utils/agent_runtime_attachment_payload.dart';
 import 'package:ui/features/home/pages/chat/utils/agent_thinking_card_locator.dart';
 import 'package:ui/features/home/pages/chat/utils/codex_slash_commands.dart';
 import 'package:ui/features/home/pages/chat/utils/deep_thinking_persistence.dart';
 import 'package:ui/features/home/pages/chat/utils/keyboard_inset_motion_tracker.dart';
+import 'package:ui/features/home/pages/codex/codex_remote_directory_picker.dart';
+import 'package:ui/features/home/pages/codex/codex_remote_workspace_browser.dart';
 import 'package:ui/widgets/chat_drawer_gesture_guard.dart';
 
 // 导入 Mixins
@@ -74,6 +78,8 @@ import 'widgets/chat_browser_overlay.dart';
 import 'widgets/chat_tool_activity_strip.dart';
 import 'package:ui/widgets/app_update_dialog.dart';
 import 'package:ui/widgets/app_background_widgets.dart';
+import 'package:ui/widgets/glass_popup.dart';
+import 'package:ui/widgets/omni_glass.dart';
 
 part 'chat_page_browser.dart';
 part 'chat_page_lifecycle.dart';
@@ -186,7 +192,7 @@ abstract class _ChatPageStateBase extends State<ChatPage>
       KeyboardInsetMotionTracker();
   final Map<ChatPageMode, ChatIslandDisplayLayer>
   _chatIslandDisplayLayerByMode = {
-    ChatPageMode.normal: ChatIslandDisplayLayer.model,
+    ChatPageMode.normal: ChatIslandDisplayLayer.tools,
     ChatPageMode.openclaw: ChatIslandDisplayLayer.mode,
     ChatPageMode.codex: ChatIslandDisplayLayer.mode,
   };
@@ -371,17 +377,32 @@ abstract class _ChatPageStateBase extends State<ChatPage>
   StreamSubscription<Map<String, dynamic>>?
   _browserSessionSnapshotChangedSubscription;
   StreamSubscription<Map<String, dynamic>>? _codexEventSubscription;
+  Timer? _remoteCodexSessionSyncTimer;
+  bool _remoteCodexSessionSyncInFlight = false;
+  String? _remoteCodexSessionSyncThreadId;
+  String _remoteCodexSessionSyncSignature = '';
+  String? _remoteCodexActivityThreadId;
+  String _remoteCodexActivityContentSignature = '';
+  int? _remoteCodexLastContentChangeAtMs;
   CodexStatus _codexStatus = CodexStatus.disconnected;
   bool _isCodexStatusLoading = false;
+  int? _activeCodexRemoteRuntimeId;
   String? _activeCodexThreadId;
   String? _activeCodexTurnId;
   String? _activeCodexModelId;
+  String? _activeCodexReasoningEffort;
   String? _activeCodexCollaborationMode;
   bool _isCodexModelListLoading = false;
   bool _isCodexCollaborationModeListLoading = false;
   String? _codexModelListError;
   String? _codexCollaborationModeListError;
   List<String> _codexModelOptions = const <String>[];
+  List<String> _codexReasoningEffortOptions = const <String>[
+    'low',
+    'medium',
+    'high',
+    'xhigh',
+  ];
   List<String> _codexCollaborationModes = const <String>[];
   CodexPermissionMode _codexPermissionMode = CodexPermissionMode.fullAccess;
   ChatBrowserSessionSnapshot? _liveBrowserSessionSnapshot;
@@ -409,6 +430,9 @@ abstract class _ChatPageStateBase extends State<ChatPage>
   double _hdPadPaneDragDelta = 0;
   final GlobalKey<OmnibotWorkspaceBrowserState> _hdPadWorkspaceBrowserKey =
       GlobalKey<OmnibotWorkspaceBrowserState>();
+  final GlobalKey<CodexRemoteWorkspaceBrowserState>
+  _hdPadRemoteWorkspaceBrowserKey =
+      GlobalKey<CodexRemoteWorkspaceBrowserState>();
 
   ChatPageMode get _activeMode => _activeConversationMode;
   ConversationMode _conversationModeForPageMode(ChatPageMode mode) {
@@ -459,6 +483,20 @@ abstract class _ChatPageStateBase extends State<ChatPage>
     );
   }
 
+  bool _isRemoteCodexRuntimeActiveForMode(ChatPageMode mode) {
+    if (mode != ChatPageMode.codex) {
+      return false;
+    }
+    final conversationId = _currentConversationIdByMode[mode];
+    if (conversationId == null) {
+      return false;
+    }
+    return _runtimeCoordinator.isEphemeralRuntime(
+      conversationId: conversationId,
+      mode: _modeKey(mode),
+    );
+  }
+
   ChatConversationRuntimeState? get _activeRuntime =>
       _runtimeForMode(_activeMode);
   int _beginConversationTargetRequest() => ++_conversationTargetRequestId;
@@ -479,7 +517,7 @@ abstract class _ChatPageStateBase extends State<ChatPage>
       _runtimeForMode(mode)?.chatIslandDisplayLayer ??
       (_chatIslandDisplayLayerByMode[mode] ??
           (mode == ChatPageMode.normal
-              ? ChatIslandDisplayLayer.model
+              ? ChatIslandDisplayLayer.tools
               : ChatIslandDisplayLayer.mode));
   bool get _isOpenClawSurface => _activeSurfaceMode == ChatSurfaceMode.openclaw;
   bool get _isWorkspaceSurface =>
@@ -593,6 +631,20 @@ abstract class _ChatPageStateBase extends State<ChatPage>
   ConversationThreadTarget get _threadTargetForMode {
     final conversationMode = _conversationModeForPageMode(_activeMode);
     final conversationId = _currentConversationIdByMode[_activeMode];
+    if (_activeMode == ChatPageMode.codex &&
+        _isRemoteCodexRuntimeActiveForMode(ChatPageMode.codex)) {
+      final threadId = _activeCodexThreadId?.trim() ?? '';
+      if (threadId.isNotEmpty) {
+        return ConversationThreadTarget.codexSession(
+          threadId: threadId,
+          runtime: 'remote',
+        );
+      }
+      return ConversationThreadTarget.newConversation(
+        mode: ConversationMode.codex,
+        codexRuntime: 'remote',
+      );
+    }
     if (conversationId == null) {
       final resolvedTarget = _resolvedThreadTarget;
       if (resolvedTarget != null &&
@@ -913,14 +965,14 @@ abstract class _ChatPageStateBase extends State<ChatPage>
     });
   }
 
-  void _forceNormalSurfaceModeLayer() {
+  void _forceNormalSurfaceToolLayer() {
     if (_chatIslandDisplayLayerForMode(ChatPageMode.normal) ==
-        ChatIslandDisplayLayer.mode) {
+        ChatIslandDisplayLayer.tools) {
       return;
     }
     _setChatIslandDisplayLayerForMode(
       ChatPageMode.normal,
-      ChatIslandDisplayLayer.mode,
+      ChatIslandDisplayLayer.tools,
     );
   }
 
@@ -928,17 +980,17 @@ abstract class _ChatPageStateBase extends State<ChatPage>
     _cancelNormalSurfaceModelReveal();
     if (!mounted) {
       _isSurfacePageScrolling = true;
-      _forceNormalSurfaceModeLayer();
+      _forceNormalSurfaceToolLayer();
       return;
     }
     if (_isSurfacePageScrolling &&
         _chatIslandDisplayLayerForMode(ChatPageMode.normal) ==
-            ChatIslandDisplayLayer.mode) {
+            ChatIslandDisplayLayer.tools) {
       return;
     }
     setState(() {
       _isSurfacePageScrolling = true;
-      _forceNormalSurfaceModeLayer();
+      _forceNormalSurfaceToolLayer();
     });
   }
 
@@ -948,7 +1000,7 @@ abstract class _ChatPageStateBase extends State<ChatPage>
       _isSurfacePageScrolling = false;
       if (mode == ChatSurfaceMode.normal) {
         _resetNormalSurfaceModelRevealInterruption();
-        _forceNormalSurfaceModeLayer();
+        _forceNormalSurfaceToolLayer();
       }
       return;
     }
@@ -956,13 +1008,13 @@ abstract class _ChatPageStateBase extends State<ChatPage>
         _isSurfacePageScrolling ||
         (mode == ChatSurfaceMode.normal &&
             _chatIslandDisplayLayerForMode(ChatPageMode.normal) !=
-                ChatIslandDisplayLayer.mode);
+                ChatIslandDisplayLayer.tools);
     if (shouldSettleState) {
       setState(() {
         _isSurfacePageScrolling = false;
         if (mode == ChatSurfaceMode.normal) {
           _resetNormalSurfaceModelRevealInterruption();
-          _forceNormalSurfaceModeLayer();
+          _forceNormalSurfaceToolLayer();
         }
       });
     } else {
@@ -1325,6 +1377,15 @@ abstract class _ChatPageStateBase extends State<ChatPage>
   }
 
   @override
+  bool isEphemeralConversation(int conversationId, ConversationMode mode) {
+    final pageMode = _pageModeForConversationMode(mode);
+    return _runtimeCoordinator.isEphemeralRuntime(
+      conversationId: conversationId,
+      mode: _modeKey(pageMode),
+    );
+  }
+
+  @override
   Future<void> persistAgentConversation() => saveConversation();
 
   @override
@@ -1404,6 +1465,7 @@ abstract class _ChatPageStateBase extends State<ChatPage>
     }
     if (!_isWorkspaceSurface && pageMode == _activeConversationMode) {
       unawaited(_persistVisibleThreadTargetIfNeeded());
+      unawaited(_syncVisibleChatConversation());
     }
     // Reload the embedded drawer's conversation list so newly persisted
     // conversations appear immediately, matching phone-mode behaviour where
@@ -1577,7 +1639,7 @@ abstract class _ChatPageStateBase extends State<ChatPage>
     _isInputAreaVisibleByMode[mode] = true;
     _isExecutingTaskByMode[mode] = false;
     _chatIslandDisplayLayerByMode[mode] = mode == ChatPageMode.normal
-        ? ChatIslandDisplayLayer.model
+        ? ChatIslandDisplayLayer.tools
         : ChatIslandDisplayLayer.mode;
     _lastAgentToolTypeByMode[mode] = null;
     _runtimeChromeSignatureByMode[mode] = '';
@@ -1588,6 +1650,8 @@ abstract class _ChatPageStateBase extends State<ChatPage>
     _userMessageEditControllerForMode(mode).clear();
     _draftMessageByMode[mode] = '';
     if (mode == ChatPageMode.codex) {
+      _stopRemoteCodexSessionSync();
+      _activeCodexRemoteRuntimeId = null;
       _activeCodexThreadId = null;
       _activeCodexTurnId = null;
     }
@@ -1697,6 +1761,10 @@ abstract class _ChatPageStateBase extends State<ChatPage>
 
   Future<void> _persistVisibleThreadTargetIfNeeded();
 
+  Future<void> _syncVisibleChatConversation();
+
+  Future<void> _clearVisibleChatConversation();
+
   void _notifySummarySheetReadyIfNeeded();
 
   Future<void> _initializeHalfScreenEngineIfNeeded();
@@ -1727,7 +1795,9 @@ abstract class _ChatPageStateBase extends State<ChatPage>
 
   Future<void> _loadCodexCollaborationModes({bool force = false});
 
-  Future<void> _selectCodexModel(String modelId);
+  Future<void> _selectCodexModel(String modelId, {bool clearComposer = true});
+
+  Future<void> _selectCodexReasoningEffort(String effort);
 
   Future<void> _activateCodexPlanMode({bool persistOnly = false});
 
@@ -1743,7 +1813,17 @@ abstract class _ChatPageStateBase extends State<ChatPage>
 
   Future<void> _handleCodexTap();
 
+  String? _codexRemoteWorkspaceNameForGreeting();
+
+  Future<void> _openCodexRemoteWorkspacePicker();
+
+  Future<void> _prepareRemoteCodexSessionTarget(
+    ConversationThreadTarget target,
+  );
+
   void _handleCodexAppServerEvent(Map<String, dynamic> event);
+
+  void _stopRemoteCodexSessionSync();
 
   Future<void> _sendCodexMessage(
     String aiMessageId,
@@ -1956,10 +2036,6 @@ abstract class _ChatPageStateBase extends State<ChatPage>
   );
 
   Future<bool> _tryAgentFlow(String aiMessageId, String userMessageId);
-
-  List<Map<String, dynamic>> _historyBeforeLatestUser(
-    List<Map<String, dynamic>> history,
-  );
 
   Future<List<Map<String, dynamic>>> _latestUserAttachments();
 

@@ -41,8 +41,10 @@ class UIKit {
         var commentEventApi: CommentEventApi? = null
         var companionTaskEventApi: CompanionTaskEventApi? = null
         var executionTaskEventApi: ExecutionTaskEventApi? = null
+        var appContext: Context? = null
 
         fun init(context: Context, halfScreenApi: HalfScreenApi) {
+            appContext = context.applicationContext
             UIKit.halfScreenApi = halfScreenApi
             catApi = CatApiImpl()
             catLayoutApi = CatLayoutApiImpl()

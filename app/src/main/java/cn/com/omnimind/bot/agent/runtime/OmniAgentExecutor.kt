@@ -1,6 +1,7 @@
 package cn.com.omnimind.bot.agent
 
 import android.content.Context
+import cn.com.omnimind.assists.controller.http.HttpController
 import cn.com.omnimind.baselib.i18n.AppLocaleManager
 import cn.com.omnimind.baselib.util.OmniLog
 import cn.com.omnimind.bot.agent.workspace.memory.LongTermMemoryIndex
@@ -145,6 +146,17 @@ class OmniAgentExecutor(
                 json = json,
                 modelOverride = modelOverride
             )
+            val toolImageContinuationPolicy = runCatching {
+                AgentToolImageContinuationPolicyResolver.resolve(
+                    HttpController.resolveChatCompletionRouteInfo(
+                        modelOrScene = agentModelScene,
+                        explicitApiBase = modelOverride?.apiBase,
+                        explicitApiKey = modelOverride?.apiKey,
+                        explicitModel = modelOverride?.modelId,
+                        explicitProtocolType = modelOverride?.protocolType
+                    )
+                )
+            }.getOrDefault(AgentToolImageContinuationPolicy.DEFAULT)
             val contextCompactor = AgentConversationContextCompactor(
                 historyRepository = historyRepository,
                 modelScene = agentModelScene,
@@ -167,7 +179,8 @@ class OmniAgentExecutor(
                     catalogRef.get() ?: error("subagent dispatcher missing parent catalog")
                 },
                 eventAdapter = eventAdapter,
-                model = agentModelScene
+                model = agentModelScene,
+                toolImageContinuationPolicy = toolImageContinuationPolicy
             )
             toolRouter = AgentToolRouter(
                 context = context,
@@ -182,7 +195,8 @@ class OmniAgentExecutor(
                 toolRegistry = toolRegistry,
                 toolRouter = toolRouter,
                 eventAdapter = eventAdapter,
-                model = agentModelScene
+                model = agentModelScene,
+                toolImageContinuationPolicy = toolImageContinuationPolicy
             )
 
             orchestrator.run(
@@ -316,8 +330,13 @@ class OmniAgentExecutor(
         userMessage: String,
         attachments: List<Map<String, Any?>>
     ): cn.com.omnimind.baselib.llm.ChatCompletionMessage {
-        val normalizedAttachments = normalizeAttachments(attachments)
-        val imageParts = mutableListOf<JsonObject>()
+        val rawText = AgentAttachmentPromptSupport.buildUserMessageText(
+            text = userMessage,
+            attachments = attachments
+        )
+        val normalizedAttachments = normalizeAttachments(
+            attachments.filter(AgentAttachmentPromptSupport::shouldSendAttachmentToModel)
+        )
         val vlmDescriptions = mutableListOf<String>()
 
         // ★ 用户上传图片时先用 VLM 描述，避免纯文本模型 400
@@ -329,7 +348,6 @@ class OmniAgentExecutor(
                 vlmDescriptions.add(description)
             } catch (e: Exception) {
                 OmniLog.w(tag, "VLM 描述失败，跳过图片: ${e.message}")
-                // ★ 不降级发送 image_url（纯文本模型不支持），仅跳过
             }
         }
 
@@ -338,11 +356,10 @@ class OmniAgentExecutor(
         } else ""
 
         val combinedText = if (descriptionText.isNotBlank()) {
-            if (userMessage.isNotBlank()) "$userMessage\n\n$descriptionText" else descriptionText
-        } else userMessage
+            if (rawText.isNotBlank()) "$rawText\n\n$descriptionText" else descriptionText
+        } else rawText
 
-        val content: JsonElement = if (imageParts.isEmpty()) {
-            JsonPrimitive(combinedText)
+        val content: JsonElement = JsonPrimitive(combinedText)
         } else {
             buildJsonArray {
                 if (combinedText.isNotBlank()) {

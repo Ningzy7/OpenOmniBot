@@ -5,9 +5,11 @@ import 'package:flutter_switch/flutter_switch.dart';
 import 'package:ui/core/router/go_router_manager.dart';
 import 'package:ui/features/home/state/habitual_hand_controller.dart';
 import 'package:ui/l10n/l10n.dart';
+import 'package:ui/models/chat_startup_behavior.dart';
 import 'package:ui/models/habitual_hand.dart';
 import 'package:ui/services/assists_core_service.dart';
 import 'package:ui/services/hide_from_recents_service.dart';
+import 'package:ui/services/special_permission.dart';
 import 'package:ui/services/storage_service.dart';
 import 'package:ui/theme/theme_context.dart';
 import 'package:ui/utils/cache_util.dart';
@@ -27,7 +29,10 @@ class _ExperienceMiscSettingPageState
   bool _hideFromRecentsEnabled = false;
   bool _vibrationEnabled = true;
   bool _autoBackToChatAfterTaskEnabled = true;
+  bool _preventScreenSleepDuringTasksEnabled = true;
+  bool _taskCompletionNotificationEnabled = true;
   bool _useIndependentChatSendButton = true;
+  ChatStartupBehavior _chatStartupBehavior = ChatStartupBehavior.resumeLast;
 
   @override
   void initState() {
@@ -38,11 +43,27 @@ class _ExperienceMiscSettingPageState
           defaultValue: true,
         ) ??
         true;
+    _preventScreenSleepDuringTasksEnabled =
+        StorageService.getBool(
+          StorageService.kPreventScreenSleepDuringTasksKey,
+          defaultValue: true,
+        ) ??
+        true;
+
+    _taskCompletionNotificationEnabled =
+        StorageService.getBool(
+          StorageService.kTaskCompletionNotificationEnabledKey,
+          defaultValue: true,
+        ) ??
+        true;
+
     _useIndependentChatSendButton =
         StorageService.isIndependentChatSendButtonEnabled();
+    _chatStartupBehavior = StorageService.getChatStartupBehavior();
     _loadHideFromRecentsState();
     _loadVibrationState();
     _loadAutoBackToChatAfterTaskState();
+    _loadRuntimeTaskState();
   }
 
   Future<void> _loadHideFromRecentsState() async {
@@ -83,6 +104,28 @@ class _ExperienceMiscSettingPageState
       });
     } catch (e) {
       debugPrint('Error loading auto back to chat setting: $e');
+    }
+  }
+
+  Future<void> _loadRuntimeTaskState() async {
+    try {
+      final preventSleep =
+          await StorageService.isPreventScreenSleepDuringTasksEnabled();
+      final notification =
+          await StorageService.isTaskCompletionNotificationEnabled();
+      if (!mounted) return;
+      setState(() {
+        _preventScreenSleepDuringTasksEnabled = preventSleep;
+        _taskCompletionNotificationEnabled = notification;
+      });
+      await AssistsMessageService.setPreventScreenSleepDuringTasksEnabled(
+        preventSleep,
+      );
+      await AssistsMessageService.setTaskCompletionNotificationEnabled(
+        notification,
+      );
+    } catch (e) {
+      debugPrint('Error loading runtime task settings: $e');
     }
   }
 
@@ -132,6 +175,54 @@ class _ExperienceMiscSettingPageState
     }
   }
 
+  Future<void> _onPreventScreenSleepDuringTasksChanged(bool value) async {
+    try {
+      await StorageService.setPreventScreenSleepDuringTasksEnabled(value);
+      final synced =
+          await AssistsMessageService.setPreventScreenSleepDuringTasksEnabled(
+            value,
+          );
+      if (!synced) {
+        throw Exception('native_sync_failed');
+      }
+      if (!mounted) return;
+      setState(() {
+        _preventScreenSleepDuringTasksEnabled = value;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      showToast(context.l10n.settingsSaveFailed, type: ToastType.error);
+    }
+  }
+
+  Future<void> _onTaskCompletionNotificationChanged(bool value) async {
+    try {
+      if (value) {
+        final granted = await ensureNotificationPermission();
+        if (!granted) {
+          if (!mounted) return;
+          showToast(context.trLegacy('需要开启通知权限'), type: ToastType.error);
+          return;
+        }
+      }
+      await StorageService.setTaskCompletionNotificationEnabled(value);
+      final synced =
+          await AssistsMessageService.setTaskCompletionNotificationEnabled(
+            value,
+          );
+      if (!synced) {
+        throw Exception('native_sync_failed');
+      }
+      if (!mounted) return;
+      setState(() {
+        _taskCompletionNotificationEnabled = value;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      showToast(context.l10n.settingsSaveFailed, type: ToastType.error);
+    }
+  }
+
   Future<void> _onIndependentChatSendButtonChanged(bool value) async {
     final saved = await StorageService.setIndependentChatSendButtonEnabled(
       value,
@@ -143,6 +234,21 @@ class _ExperienceMiscSettingPageState
     }
     setState(() {
       _useIndependentChatSendButton = value;
+    });
+  }
+
+  Future<void> _onChatStartupBehaviorChanged(ChatStartupBehavior? value) async {
+    if (value == null) {
+      return;
+    }
+    final saved = await StorageService.setChatStartupBehavior(value);
+    if (!mounted) return;
+    if (!saved) {
+      showToast(context.l10n.settingsSaveFailed, type: ToastType.error);
+      return;
+    }
+    setState(() {
+      _chatStartupBehavior = value;
     });
   }
 
@@ -183,6 +289,12 @@ class _ExperienceMiscSettingPageState
             },
           ),
           _SettingItem(
+            icon: Icons.power_settings_new_rounded,
+            title: context.trLegacy('启动时'),
+            subtitle: context.trLegacy('选择应用启动后打开的对话'),
+            trailing: _buildStartupBehaviorDropdown(_chatStartupBehavior),
+          ),
+          _SettingItem(
             icon: Icons.visibility_off_outlined,
             iconSvg: 'assets/home/hide_recents_setting_icon.svg',
             title: context.l10n.settingsHideRecentsTitle,
@@ -219,6 +331,24 @@ class _ExperienceMiscSettingPageState
             trailing: _buildSwitchTrailing(
               value: _autoBackToChatAfterTaskEnabled,
               onToggle: _onAutoBackToChatAfterTaskChanged,
+            ),
+          ),
+          _SettingItem(
+            icon: Icons.screen_lock_portrait_outlined,
+            title: context.trLegacy('防止任务运行时屏幕休眠'),
+            subtitle: context.trLegacy('任务运行期间保持屏幕常亮，适用于 Agent、Codex 和纯聊天'),
+            trailing: _buildSwitchTrailing(
+              value: _preventScreenSleepDuringTasksEnabled,
+              onToggle: _onPreventScreenSleepDuringTasksChanged,
+            ),
+          ),
+          _SettingItem(
+            icon: Icons.notifications_active_outlined,
+            title: context.trLegacy('任务完成通知'),
+            subtitle: context.trLegacy('Agent、Codex 和纯聊天完成后推送提醒'),
+            trailing: _buildSwitchTrailing(
+              value: _taskCompletionNotificationEnabled,
+              onToggle: _onTaskCompletionNotificationChanged,
             ),
           ),
           _SettingItem(
@@ -440,6 +570,46 @@ class _ExperienceMiscSettingPageState
 
   Widget _buildDropdownText(String text) {
     return Text(text, maxLines: 1, overflow: TextOverflow.ellipsis);
+  }
+
+  Widget _buildStartupBehaviorDropdown(ChatStartupBehavior value) {
+    final palette = context.omniPalette;
+    return Padding(
+      padding: const EdgeInsets.only(left: 12),
+      child: SizedBox(
+        width: 132,
+        child: DropdownButtonHideUnderline(
+          child: DropdownButton<ChatStartupBehavior>(
+            value: value,
+            isDense: true,
+            isExpanded: true,
+            borderRadius: BorderRadius.circular(10),
+            dropdownColor: palette.surfacePrimary,
+            style: TextStyle(
+              color: palette.textPrimary,
+              fontSize: 12,
+              fontWeight: FontWeight.w500,
+            ),
+            icon: Icon(
+              Icons.keyboard_arrow_down_rounded,
+              size: 18,
+              color: palette.textTertiary,
+            ),
+            items: ChatStartupBehavior.values
+                .map(
+                  (behavior) => DropdownMenuItem(
+                    value: behavior,
+                    child: _buildDropdownText(
+                      context.trLegacy(behavior.legacyLabel),
+                    ),
+                  ),
+                )
+                .toList(),
+            onChanged: _onChatStartupBehaviorChanged,
+          ),
+        ),
+      ),
+    );
   }
 
   Widget _buildSwitchTrailing({

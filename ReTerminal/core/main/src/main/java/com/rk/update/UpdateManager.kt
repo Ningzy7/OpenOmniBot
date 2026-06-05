@@ -4,6 +4,7 @@ import com.rk.libcommons.application
 import com.rk.libcommons.child
 import com.rk.libcommons.createFileIfNot
 import com.rk.libcommons.localBinDir
+import com.rk.libcommons.ShellAssetWriter
 import java.io.File
 
 class UpdateManager {
@@ -15,7 +16,7 @@ class UpdateManager {
 
         if (initFile.exists().not()){
             initFile.createFileIfNot()
-            initFile.writeText(application!!.assets.open("init-host.sh").bufferedReader().use { it.readText() })
+            ShellAssetWriter.writeExecutableShellAsset(application!!, "init-host.sh", initFile)
         }
 
         val initFilex: File = localBinDir().child("init")
@@ -25,7 +26,7 @@ class UpdateManager {
 
         if (initFilex.exists().not()){
             initFilex.createFileIfNot()
-            initFilex.writeText(application!!.assets.open("init.sh").bufferedReader().use { it.readText() })
+            ShellAssetWriter.writeExecutableShellAsset(application!!, "init.sh", initFilex)
         }
     }
 }

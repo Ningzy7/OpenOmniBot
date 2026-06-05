@@ -9,6 +9,7 @@ import com.ai.assistance.operit.terminal.setup.EnvironmentSetupLogic
 import cn.com.omnimind.baselib.database.DatabaseHelper
 import cn.com.omnimind.bot.BuildConfig
 import cn.com.omnimind.bot.agent.AgentWorkspaceManager
+import cn.com.omnimind.bot.util.TaskRuntimeSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,6 +27,7 @@ class CodexAppServerManager private constructor(
     private val threadStartMutex = Mutex()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val bindingRepository = CodexThreadBindingRepository(appContext)
+    private val remoteConfigStore = CodexRemoteBridgeConfigStore(appContext)
     private val activeTurnsByThreadId = ConcurrentHashMap<String, String>()
 
     @Volatile
@@ -34,6 +36,8 @@ class CodexAppServerManager private constructor(
     @Volatile
     private var session: CodexAppServerSession? = null
     @Volatile
+    private var activeRuntime: CodexRuntimeKind? = null
+    @Volatile
     private var eventListener: ((Map<String, Any?>) -> Unit)? = null
 
     fun setEventListener(listener: ((Map<String, Any?>) -> Unit)?) {
@@ -41,34 +45,68 @@ class CodexAppServerManager private constructor(
     }
 
     suspend fun status(): Map<String, Any?> {
-        val probe = probeCodex()
+        val runtime = resolveRuntime()
+        val connected = session?.isRunning == true && activeRuntime == runtime.kind
+        val probe = when (runtime.kind) {
+            CodexRuntimeKind.REMOTE -> probeRemoteCodex(runtime.remoteConfig)
+            CodexRuntimeKind.LOCAL -> probeCodex()
+        }
         return linkedMapOf(
-            "connected" to (session?.isRunning == true),
+            "connected" to connected,
             "ready" to probe.ready,
             "version" to probe.version,
             "error" to probe.error,
             "codexHome" to CodexAppServerDefaults.CODEX_HOME,
-            "cwd" to resolveDefaultCwd()
+            "cwd" to resolveDefaultCwd(),
+            "runtime" to runtime.kind.payloadValue,
+            "remoteEnabled" to runtime.remoteConfig.enabled,
+            "remoteBridgeUrl" to runtime.remoteConfig.bridgeUrl,
+            "remoteCwd" to runtime.remoteConfig.cwd,
+            "remoteConfigured" to runtime.remoteConfig.isConfigured,
+            "remoteTransport" to probe.details["appServerTransport"],
+            "remoteDesktopAvailable" to probe.details["desktopAppServerAvailable"],
+            "remoteActiveConnections" to probe.details["activeConnections"],
+            "remoteUptimeMs" to probe.details["uptimeMs"]
         )
     }
 
     suspend fun connect(): Map<String, Any?> {
         sessionMutex.withLock {
+            val runtime = resolveRuntime()
             val existing = session
-            if (existing?.isRunning == true) {
+            if (existing?.isRunning == true && activeRuntime == runtime.kind) {
                 return status()
             }
+            existing?.disconnect()
+            session = null
+            activeRuntime = null
+            activeTurnsByThreadId.clear()
             val nextSession = CodexAppServerSession(
                 context = appContext,
                 scope = scope,
-                onServerMessage = ::handleServerMessage
+                onServerMessage = ::handleServerMessage,
+                connectionFactory = when (runtime.kind) {
+                    CodexRuntimeKind.REMOTE -> {
+                        {
+                            RemoteCodexBridgeConnection(
+                                config = runtime.remoteConfig,
+                                scope = scope
+                            )
+                        }
+                    }
+                    CodexRuntimeKind.LOCAL -> null
+                }
             )
             session = nextSession
+            activeRuntime = runtime.kind
             try {
                 nextSession.start(clientVersion = BuildConfig.VERSION_NAME)
             } catch (error: Throwable) {
                 if (session === nextSession) {
                     session = null
+                }
+                if (activeRuntime == runtime.kind) {
+                    activeRuntime = null
                 }
                 throw error
             }
@@ -80,6 +118,7 @@ class CodexAppServerManager private constructor(
         sessionMutex.withLock {
             session?.disconnect()
             session = null
+            activeRuntime = null
             activeTurnsByThreadId.clear()
         }
         return status()
@@ -94,10 +133,15 @@ class CodexAppServerManager private constructor(
             "thread/resume" -> requestWithResolvedThread("thread/resume", args)
             "thread/read" -> requestWithResolvedThread("thread/read", args)
             "thread/list" -> listThreads(args)
+            "thread/loaded/list" -> requestWrappedList("thread/loaded/list", args, "threads")
             "thread/archive" -> archiveThread(args, archived = true)
             "thread/unarchive" -> archiveThread(args, archived = false)
             "thread/name/set" -> setThreadName(args)
-            "model/list" -> requestWrappedList("model/list", args, "models")
+            "model/list" -> requestWrappedList(
+                "model/list",
+                args.ifEmpty { mapOf("limit" to 100) },
+                "models"
+            )
             "collaborationMode/list" -> requestWrappedList(
                 "collaborationMode/list",
                 args,
@@ -105,6 +149,12 @@ class CodexAppServerManager private constructor(
             )
             "config/local/read" -> readLocalConfig()
             "config/local/write" -> writeLocalConfig(args)
+            "config/remote/test" -> testRemoteConfig(args)
+            "config/remote/fs/list" -> listRemoteDirectories(args)
+            "config/remote/fs/read" -> readRemoteFile(args)
+            "config/remote/fs/write" -> writeRemoteFile(args)
+            "config/remote/fs/delete" -> deleteRemotePath(args)
+            "config/remote/fs/move" -> moveRemotePath(args)
             "turn/start" -> startTurn(args)
             "turn/steer" -> steerTurn(args)
             "turn/interrupt" -> interruptTurn(args)
@@ -122,6 +172,7 @@ class CodexAppServerManager private constructor(
     }
 
     private suspend fun startThread(args: Map<String, Any?>): Map<String, Any?> = threadStartMutex.withLock {
+        val shouldBindLocally = shouldSyncLocalThreadBindings()
         val cwd = sanitizeCodexAbsolutePath(args.stringValue("cwd")) ?: resolveDefaultCwd()
         val conversationId = args.longValue("conversationId")
         val params = linkedMapOf<String, Any?>(
@@ -133,14 +184,14 @@ class CodexAppServerManager private constructor(
             params["approvalsReviewer"] = it
         }
         addCodexOptionalRunParams(params, args)
-        if (conversationId != null) {
+        if (shouldBindLocally && conversationId != null) {
             pendingThreadStartConversationId = conversationId
         }
         try {
             val response = request("thread/start", params) as Map<String, Any?>
             val threadId = extractThreadId(response) ?: response.stringValue("id")
             var localConversationId: Long? = null
-            if (!threadId.isNullOrBlank()) {
+            if (shouldBindLocally && !threadId.isNullOrBlank()) {
                 localConversationId = bindingRepository.ensureBinding(
                     threadId = threadId,
                     conversationId = conversationId,
@@ -161,13 +212,11 @@ class CodexAppServerManager private constructor(
         args["cursor"]?.let { params["cursor"] = it }
         args["limit"]?.let { params["limit"] = it }
         args["sortKey"]?.let { params["sortKey"] = it }
-        params["sourceKinds"] = args["sourceKinds"] ?: listOf(
-            "interactive",
-            "background",
-            "subAgentInteractive"
-        )
+        params["sourceKinds"] = args["sourceKinds"] ?: DEFAULT_CODEX_THREAD_SOURCE_KINDS
         val response = request("thread/list", params) as Map<String, Any?>
-        syncThreadListResponse(response)
+        if (shouldSyncLocalThreadBindings()) {
+            syncThreadListResponse(response)
+        }
         return response
     }
 
@@ -176,13 +225,27 @@ class CodexAppServerManager private constructor(
         args: Map<String, Any?>
     ): Map<String, Any?> {
         val threadId = resolveThreadId(args)
-        val response = request(method, mapOf("threadId" to threadId)) as Map<String, Any?>
-        if (method == "thread/read" || method == "thread/resume") {
+        val params = linkedMapOf<String, Any?>("threadId" to threadId)
+        if (method == "thread/read") {
+            args["includeTurns"]?.let { params["includeTurns"] = it }
+        }
+        val response = request(method, params) as Map<String, Any?>
+        if (shouldSyncLocalThreadBindings() && (method == "thread/read" || method == "thread/resume")) {
             syncThreadListResponse(response)
         }
+        if (method == "thread/read" || method == "thread/resume") {
+            syncActiveTurnSnapshot(threadId, response)
+        }
+        val activeTurnId = activeTurnsByThreadId[threadId]
         return response.withLocalIds(
             threadId = threadId,
-            conversationId = bindingRepository.getBindingByThreadId(threadId)?.conversationId
+            conversationId = localConversationIdForThread(threadId),
+            turnId = activeTurnId,
+            active = if (method == "thread/read" || method == "thread/resume") {
+                activeTurnId != null
+            } else {
+                null
+            }
         )
     }
 
@@ -193,10 +256,12 @@ class CodexAppServerManager private constructor(
         val threadId = resolveThreadId(args)
         val method = if (archived) "thread/archive" else "thread/unarchive"
         val response = request(method, mapOf("threadId" to threadId)) as Map<String, Any?>
-        bindingRepository.setArchived(threadId, archived)
+        if (shouldSyncLocalThreadBindings()) {
+            bindingRepository.setArchived(threadId, archived)
+        }
         return response.withLocalIds(
             threadId = threadId,
-            conversationId = bindingRepository.getBindingByThreadId(threadId)?.conversationId
+            conversationId = localConversationIdForThread(threadId)
         )
     }
 
@@ -207,10 +272,12 @@ class CodexAppServerManager private constructor(
             "thread/name/set",
             mapOf("threadId" to threadId, "name" to name)
         ) as Map<String, Any?>
-        bindingRepository.updateTitle(threadId, name)
+        if (shouldSyncLocalThreadBindings()) {
+            bindingRepository.updateTitle(threadId, name)
+        }
         return response.withLocalIds(
             threadId = threadId,
-            conversationId = bindingRepository.getBindingByThreadId(threadId)?.conversationId
+            conversationId = localConversationIdForThread(threadId)
         )
     }
 
@@ -257,7 +324,7 @@ class CodexAppServerManager private constructor(
         }
         return response.withLocalIds(
             threadId = threadId,
-            conversationId = bindingRepository.getBindingByThreadId(threadId)?.conversationId,
+            conversationId = localConversationIdForThread(threadId),
             turnId = turnId
         )
     }
@@ -292,7 +359,7 @@ class CodexAppServerManager private constructor(
         }
         return response.withLocalIds(
             threadId = threadId,
-            conversationId = bindingRepository.getBindingByThreadId(threadId)?.conversationId,
+            conversationId = localConversationIdForThread(threadId),
             turnId = turnId
         )
     }
@@ -313,7 +380,7 @@ class CodexAppServerManager private constructor(
         ) as Map<String, Any?>
         return response.withLocalIds(
             threadId = threadId,
-            conversationId = bindingRepository.getBindingByThreadId(threadId)?.conversationId,
+            conversationId = localConversationIdForThread(threadId),
             turnId = expectedTurnId
         )
     }
@@ -330,7 +397,7 @@ class CodexAppServerManager private constructor(
         activeTurnsByThreadId.remove(threadId)
         return response.withLocalIds(
             threadId = threadId,
-            conversationId = bindingRepository.getBindingByThreadId(threadId)?.conversationId,
+            conversationId = localConversationIdForThread(threadId),
             turnId = turnId
         )
     }
@@ -345,6 +412,7 @@ class CodexAppServerManager private constructor(
     }
 
     private suspend fun readLocalConfig(): Map<String, Any?> {
+        val remoteConfig = remoteConfigStore.read()
         val command = """
             mkdir -p ${shellQuote(CodexAppServerDefaults.CODEX_HOME)}
             printf '__OMNI_CODEX_CONFIG_START__\n'
@@ -358,71 +426,170 @@ class CodexAppServerManager private constructor(
             fi
             printf '\n__OMNI_CODEX_AUTH_END__\n'
         """.trimIndent()
-        val result = TerminalManager.getInstance(appContext).executeHiddenCommand(
-            command = command,
-            executorKey = "codex-config-read",
-            timeoutMs = 30_000L
-        )
-        if (!result.isOk || result.exitCode != 0) {
-            throw IllegalStateException(
-                result.error.ifBlank { result.rawOutputPreview.ifBlank { "Failed to read Codex config." } }
+        val localRead = runCatching {
+            val result = TerminalManager.getInstance(appContext).executeHiddenCommand(
+                command = command,
+                executorKey = "codex-config-read",
+                timeoutMs = 30_000L
             )
+            if (!result.isOk || result.exitCode != 0) {
+                throw IllegalStateException(
+                    result.error.ifBlank { result.rawOutputPreview.ifBlank { "Failed to read Codex config." } }
+                )
+            }
+            result.output
         }
-
+        if (localRead.isFailure && !remoteConfig.enabled) {
+            throw localRead.exceptionOrNull()
+                ?: IllegalStateException("Failed to read Codex config.")
+        }
+        val localOutput = localRead.getOrDefault("")
         val configToml = extractMarkedBlock(
-            result.output,
+            localOutput,
             "__OMNI_CODEX_CONFIG_START__",
             "__OMNI_CODEX_CONFIG_END__"
         )
         val authJson = extractMarkedBlock(
-            result.output,
+            localOutput,
             "__OMNI_CODEX_AUTH_START__",
             "__OMNI_CODEX_AUTH_END__"
         )
         return buildCodexLocalConfigPayload(
             model = extractTomlString(configToml, "model").orEmpty(),
             baseUrl = extractTomlString(configToml, "base_url").orEmpty(),
-            apiKey = extractOpenAiApiKey(authJson).orEmpty()
+            apiKey = extractOpenAiApiKey(authJson).orEmpty(),
+            remoteConfig = remoteConfig,
+            runtime = resolveRuntime().kind.payloadValue
         )
     }
 
     private suspend fun writeLocalConfig(args: Map<String, Any?>): Map<String, Any?> {
-        val baseUrl = args.stringValue("baseUrl")
-            ?: throw IllegalArgumentException("baseUrl is required")
-        val model = args.stringValue("model")
-            ?: throw IllegalArgumentException("model is required")
-        val apiKey = args.stringValue("apiKey")
-            ?: throw IllegalArgumentException("OPENAI_API_KEY is required")
-
-        val configToml = buildCodexConfigToml(baseUrl = baseUrl, model = model)
-        val authJson = JSONObject()
-            .put("OPENAI_API_KEY", apiKey)
-            .toString(4) + "\n"
-        val configPath = "${CodexAppServerDefaults.CODEX_HOME}/config.toml"
-        val authPath = "${CodexAppServerDefaults.CODEX_HOME}/auth.json"
-        val command = """
-            set -eu
-            mkdir -p ${shellQuote(CodexAppServerDefaults.CODEX_HOME)}
-            umask 077
-            printf %s ${shellQuote(configToml)} > ${shellQuote(configPath)}
-            printf %s ${shellQuote(authJson)} > ${shellQuote(authPath)}
-            chmod 600 ${shellQuote(configPath)} ${shellQuote(authPath)}
-            printf '__OMNI_CODEX_WRITE_OK__\n'
-        """.trimIndent()
-        val result = TerminalManager.getInstance(appContext).executeHiddenCommand(
-            command = command,
-            executorKey = "codex-config-write",
-            timeoutMs = 30_000L
+        val baseUrl = args.stringValue("baseUrl").orEmpty()
+        val model = args.stringValue("model").orEmpty()
+        val apiKey = args.stringValue("apiKey").orEmpty()
+        val remoteConfig = CodexRemoteBridgeConfig(
+            enabled = args["remoteEnabled"] == true,
+            bridgeUrl = args.stringValue("remoteBridgeUrl").orEmpty(),
+            authToken = args.stringValue("remoteBridgeToken").orEmpty(),
+            cwd = args.stringValue("remoteCwd").orEmpty()
         )
-        if (!result.isOk || result.exitCode != 0) {
-            throw IllegalStateException(
-                result.error.ifBlank { result.rawOutputPreview.ifBlank { "Failed to write Codex config." } }
+        val localComplete = baseUrl.isNotBlank() && model.isNotBlank() && apiKey.isNotBlank()
+        if (remoteConfig.enabled && !remoteConfig.isConfigured) {
+            throw IllegalArgumentException("Remote Codex bridge URL and cwd are required.")
+        }
+
+        val savedRemoteConfig = remoteConfigStore.write(remoteConfig)
+        if (localComplete) {
+            val configToml = buildCodexConfigToml(baseUrl = baseUrl, model = model)
+            val authJson = JSONObject()
+                .put("OPENAI_API_KEY", apiKey)
+                .toString(4) + "\n"
+            val configPath = "${CodexAppServerDefaults.CODEX_HOME}/config.toml"
+            val authPath = "${CodexAppServerDefaults.CODEX_HOME}/auth.json"
+            val command = """
+                set -eu
+                mkdir -p ${shellQuote(CodexAppServerDefaults.CODEX_HOME)}
+                umask 077
+                printf %s ${shellQuote(configToml)} > ${shellQuote(configPath)}
+                printf %s ${shellQuote(authJson)} > ${shellQuote(authPath)}
+                chmod 600 ${shellQuote(configPath)} ${shellQuote(authPath)}
+                printf '__OMNI_CODEX_WRITE_OK__\n'
+            """.trimIndent()
+            val result = TerminalManager.getInstance(appContext).executeHiddenCommand(
+                command = command,
+                executorKey = "codex-config-write",
+                timeoutMs = 30_000L
             )
+            if (!result.isOk || result.exitCode != 0) {
+                throw IllegalStateException(
+                    result.error.ifBlank { result.rawOutputPreview.ifBlank { "Failed to write Codex config." } }
+                )
+            }
+        }
+        sessionMutex.withLock {
+            session?.disconnect()
+            session = null
+            activeRuntime = null
+            activeTurnsByThreadId.clear()
         }
         return buildCodexLocalConfigPayload(
             model = model,
             baseUrl = baseUrl,
-            apiKey = apiKey
+            apiKey = apiKey,
+            remoteConfig = savedRemoteConfig,
+            runtime = resolveRuntime().kind.payloadValue
+        )
+    }
+
+    private suspend fun testRemoteConfig(args: Map<String, Any?>): Map<String, Any?> {
+        val remoteConfig = CodexRemoteBridgeConfig(
+            enabled = true,
+            bridgeUrl = args.stringValue("remoteBridgeUrl").orEmpty(),
+            authToken = args.stringValue("remoteBridgeToken").orEmpty(),
+            cwd = args.stringValue("remoteCwd").orEmpty()
+        )
+        if (!remoteConfig.isConfigured) {
+            return linkedMapOf(
+                "ok" to false,
+                "ready" to false,
+                "error" to "Remote Codex bridge URL and cwd are required.",
+                "cwd" to remoteConfig.cwd
+            )
+        }
+        val probe = probeCodexRemoteBridge(remoteConfig)
+        return linkedMapOf(
+            "ok" to probe.ready,
+            "ready" to probe.ready,
+            "version" to probe.version,
+            "error" to probe.error,
+            "cwd" to (probe.cwd ?: remoteConfig.cwd)
+        )
+    }
+
+    private suspend fun listRemoteDirectories(args: Map<String, Any?>): Map<String, Any?> {
+        val remoteConfig = remoteConfigFromArgs(args)
+        val path = args.stringValue("path") ?: remoteConfig.cwd.takeIf { it.isNotBlank() }
+        return listCodexRemoteBridgeDirectory(remoteConfig, path)
+    }
+
+    private suspend fun readRemoteFile(args: Map<String, Any?>): Map<String, Any?> {
+        return readCodexRemoteBridgeFile(
+            config = remoteConfigFromArgs(args),
+            path = args.stringValue("path")
+        )
+    }
+
+    private suspend fun writeRemoteFile(args: Map<String, Any?>): Map<String, Any?> {
+        return writeCodexRemoteBridgeFile(
+            config = remoteConfigFromArgs(args),
+            path = args.stringValue("path"),
+            content = args["content"]?.toString().orEmpty()
+        )
+    }
+
+    private suspend fun deleteRemotePath(args: Map<String, Any?>): Map<String, Any?> {
+        return deleteCodexRemoteBridgePath(
+            config = remoteConfigFromArgs(args),
+            path = args.stringValue("path"),
+            recursive = args["recursive"] == true
+        )
+    }
+
+    private suspend fun moveRemotePath(args: Map<String, Any?>): Map<String, Any?> {
+        return moveCodexRemoteBridgePath(
+            config = remoteConfigFromArgs(args),
+            path = args.stringValue("path"),
+            destinationPath = args.stringValue("destinationPath")
+        )
+    }
+
+    private suspend fun remoteConfigFromArgs(args: Map<String, Any?>): CodexRemoteBridgeConfig {
+        val storedConfig = remoteConfigStore.read()
+        return CodexRemoteBridgeConfig(
+            enabled = true,
+            bridgeUrl = args.stringValue("remoteBridgeUrl") ?: storedConfig.bridgeUrl,
+            authToken = args.stringValue("remoteBridgeToken") ?: storedConfig.authToken,
+            cwd = args.stringValue("remoteCwd") ?: storedConfig.cwd
         )
     }
 
@@ -475,16 +642,42 @@ class CodexAppServerManager private constructor(
         if (!explicitThreadId.isNullOrBlank()) {
             return explicitThreadId
         }
-        val conversationId = args.longValue("conversationId")
-        if (conversationId != null) {
-            val binding = bindingRepository.getBindingByConversationId(conversationId)
-            if (binding != null) {
-                return binding.threadId
+        if (shouldSyncLocalThreadBindings()) {
+            val conversationId = args.longValue("conversationId")
+            if (conversationId != null) {
+                val binding = bindingRepository.getBindingByConversationId(conversationId)
+                if (binding != null) {
+                    return binding.threadId
+                }
             }
         }
         val response = startThread(args + mapOf("cwd" to cwd))
         return response["threadId"]?.toString()?.takeIf { it.isNotBlank() }
             ?: throw IllegalStateException("thread/start did not return a threadId")
+    }
+
+    private fun shouldSyncLocalThreadBindings(): Boolean {
+        return activeRuntime != CodexRuntimeKind.REMOTE &&
+            resolveRuntime().kind != CodexRuntimeKind.REMOTE
+    }
+
+    private suspend fun localConversationIdForThread(threadId: String): Long? {
+        if (!shouldSyncLocalThreadBindings()) {
+            return null
+        }
+        return bindingRepository.getBindingByThreadId(threadId)?.conversationId
+    }
+
+    private fun syncActiveTurnSnapshot(threadId: String, response: Map<String, Any?>) {
+        val active = codexThreadActivity(response)
+        val activeTurnId = extractActiveTurnId(response)
+        if (active == true && !activeTurnId.isNullOrBlank()) {
+            activeTurnsByThreadId[threadId] = activeTurnId
+            return
+        }
+        if (active == false) {
+            activeTurnsByThreadId.remove(threadId)
+        }
     }
 
     private suspend fun request(method: String, params: Any?): Any {
@@ -506,18 +699,83 @@ class CodexAppServerManager private constructor(
     }
 
     private suspend fun handleServerMessage(message: Map<String, Any?>) {
-        val method = message["method"]?.toString()?.trim().orEmpty()
-        val params = message.mapValue("params")
-        val threadId = extractThreadId(message)
-        val turnId = extractTurnId(message)
-        if (!threadId.isNullOrBlank() && !turnId.isNullOrBlank() && method == "turn/started") {
-            activeTurnsByThreadId[threadId] = turnId
+        val method = extractCodexServerMethod(message)
+        val explicitParams = extractCodexServerParams(message)
+        val params = if (explicitParams.isNotEmpty()) {
+            explicitParams
+        } else {
+            syntheticCodexServerParams(message, method)
         }
-        if (!threadId.isNullOrBlank() && method == "turn/completed") {
+        val threadId = extractThreadId(message)
+        val turnId = extractTurnId(message) ?: extractActiveTurnId(message)
+        // Diagnostic: log every server-side method that reaches Kotlin so the
+        // user can verify via `adb logcat -s CodexAppServerManager:V` whether
+        // commandExecution / rawResponseItem events actually arrive over the
+        // bridge. If item/started events for commandExecution are missing
+        // here but present in `codex app-server` stdout, the bridge is
+        // dropping them; if present here but missing on Flutter side, the
+        // EventChannel pipe is the problem.
+        val diagItemType = (message["params"] as? Map<*, *>)
+            ?.get("item")?.let { it as? Map<*, *> }
+            ?.get("type")?.toString()
+            ?: (params["item"] as? Map<*, *>)?.get("type")?.toString()
+        Log.d(
+            "CodexAppServerManager",
+            "<- method=$method itemType=$diagItemType threadId=$threadId turnId=$turnId"
+        )
+        val protocolEventType = if (method == "codex/event") {
+            codexProtocolEventType(params)
+        } else {
+            ""
+        }
+        if (!threadId.isNullOrBlank() && !turnId.isNullOrBlank() &&
+            (method == "turn/started" ||
+                protocolEventType == "task_started" ||
+                protocolEventType == "turn_started")) {
+            activeTurnsByThreadId[threadId] = turnId
+            TaskRuntimeSettings.onTaskStarted(appContext)
+        }
+        if (!threadId.isNullOrBlank() && method == "thread/status/changed") {
+            val active = codexThreadActivity(message)
+            if (active == true && !turnId.isNullOrBlank()) {
+                activeTurnsByThreadId[threadId] = turnId
+            } else if (active == false) {
+                activeTurnsByThreadId.remove(threadId)
+            }
+        }
+        if (!threadId.isNullOrBlank() &&
+            (method == "turn/completed" ||
+                protocolEventType == "task_complete" ||
+                protocolEventType == "turn_complete" ||
+                protocolEventType == "turn_aborted")) {
+            activeTurnsByThreadId.remove(threadId)
+        }
+        if (!threadId.isNullOrBlank() &&
+            (method == "error" || method == "turn/failed") &&
+            params["willRetry"] != true) {
+            // codex app-server emits top-level `error` notifications when a
+            // turn fails terminally (no follow-up turn/completed will come).
+            // Clear the active turn so subsequent thread/read responses
+            // surface active=false to the Flutter side.
+            activeTurnsByThreadId.remove(threadId)
+        }
+        if (!threadId.isNullOrBlank() && method == "thread/closed") {
             activeTurnsByThreadId.remove(threadId)
         }
 
         val localConversationId = syncMessage(method, message, params, threadId)
+        if (method == "turn/completed" ||
+            protocolEventType == "task_complete" ||
+            protocolEventType == "turn_complete") {
+            TaskRuntimeSettings.onTaskFinished(appContext)
+            TaskRuntimeSettings.notifyTaskFinished(
+                context = appContext,
+                title = "Codex task completed",
+                message = "Tap to view the completed Codex turn.",
+                conversationId = localConversationId,
+                conversationMode = "codex"
+            )
+        }
         emitEvent(
             linkedMapOf(
                 "method" to method,
@@ -537,6 +795,9 @@ class CodexAppServerManager private constructor(
         params: Map<String, Any?>,
         threadId: String?
     ): Long? {
+        if (!shouldSyncLocalThreadBindings()) {
+            return null
+        }
         return when (method) {
             "thread/started" -> {
                 val thread = params.mapValue("thread")
@@ -633,7 +894,21 @@ class CodexAppServerManager private constructor(
         }
     }
 
+    private suspend fun probeRemoteCodex(config: CodexRemoteBridgeConfig): CodexProbe {
+        val probe = probeCodexRemoteBridge(config)
+        return CodexProbe(
+            ready = probe.ready,
+            version = probe.version,
+            error = probe.error,
+            details = probe.details
+        )
+    }
+
     private suspend fun resolveDefaultCwd(): String {
+        val runtime = resolveRuntime()
+        if (runtime.kind == CodexRuntimeKind.REMOTE) {
+            return runtime.remoteConfig.cwd.trim()
+        }
         return runCatching {
             val workspaceRoot = AgentWorkspaceManager.rootDirectory(appContext)
             workspaceRoot.mkdirs()
@@ -645,10 +920,22 @@ class CodexAppServerManager private constructor(
         }.getOrNull() ?: CodexAppServerDefaults.FALLBACK_CWD
     }
 
+    private fun resolveRuntime(): CodexRuntime {
+        val remoteConfig = remoteConfigStore.read()
+        return if (remoteConfig.enabled) {
+            CodexRuntime(CodexRuntimeKind.REMOTE, remoteConfig)
+        } else {
+            CodexRuntime(CodexRuntimeKind.LOCAL, remoteConfig)
+        }
+    }
+
     private suspend fun resolveThreadId(args: Map<String, Any?>): String {
         val explicit = args.stringValue("threadId") ?: args.stringValue("thread_id")
         if (!explicit.isNullOrBlank()) {
             return explicit
+        }
+        if (!shouldSyncLocalThreadBindings()) {
+            throw IllegalArgumentException("threadId is required for remote Codex sessions")
         }
         val conversationId = args.longValue("conversationId")
             ?: throw IllegalArgumentException("threadId or conversationId is required")
@@ -683,7 +970,8 @@ class CodexAppServerManager private constructor(
     private data class CodexProbe(
         val ready: Boolean,
         val version: String?,
-        val error: String?
+        val error: String?,
+        val details: Map<String, Any?> = emptyMap()
     )
 
     companion object {
@@ -700,6 +988,16 @@ class CodexAppServerManager private constructor(
     }
 }
 
+private data class CodexRuntime(
+    val kind: CodexRuntimeKind,
+    val remoteConfig: CodexRemoteBridgeConfig
+)
+
+private enum class CodexRuntimeKind(val payloadValue: String) {
+    LOCAL("local"),
+    REMOTE("remote")
+}
+
 private data class CodexThreadListEntry(
     val threadId: String,
     val cwd: String?,
@@ -707,10 +1005,11 @@ private data class CodexThreadListEntry(
     val archived: Boolean?
 )
 
-private fun Map<String, Any?>.withLocalIds(
+internal fun Map<String, Any?>.withLocalIds(
     threadId: String?,
     conversationId: Long?,
-    turnId: String? = null
+    turnId: String? = null,
+    active: Boolean? = null
 ): Map<String, Any?> {
     val result = LinkedHashMap(this)
     if (!threadId.isNullOrBlank()) {
@@ -721,6 +1020,12 @@ private fun Map<String, Any?>.withLocalIds(
     }
     if (!turnId.isNullOrBlank()) {
         result["turnId"] = turnId
+        if (active == true) {
+            result["activeTurnId"] = turnId
+        }
+    }
+    if (active != null) {
+        result["active"] = active
     }
     return result
 }
@@ -764,20 +1069,82 @@ internal fun addCodexOptionalRunParams(
 ) {
     args["model"]?.let { params["model"] = it }
     args["effort"]?.let { params["effort"] = it }
-    args["collaborationMode"]?.let { params["collaborationMode"] = it }
+    resolveCodexCollaborationMode(args)?.let { params["collaborationMode"] = it }
     args["serviceTier"]?.let { params["serviceTier"] = it }
+}
+
+internal fun resolveCodexCollaborationMode(args: Map<String, Any?>): Map<String, Any?>? {
+    val rawMode = args["collaborationMode"] ?: return null
+    val source = rawMode.asStringMap()
+    val mode = when {
+        source != null -> {
+            source.stringValue("mode")
+                ?: source.stringValue("value")
+                ?: source.stringValue("name")
+        }
+        rawMode is String -> rawMode.trim()
+        else -> rawMode.toString().trim()
+    }?.normalizeCodexCollaborationModeKind() ?: return null
+
+    val sourceSettings = source?.mapValue("settings").orEmpty()
+    val model = sourceSettings.stringValue("model")
+        ?: source?.stringValue("model")
+        ?: args.stringValue("model")
+        ?: return null
+    val reasoningEffort = sourceSettings.stringValue("reasoning_effort")
+        ?: sourceSettings.stringValue("reasoningEffort")
+        ?: source?.stringValue("reasoning_effort")
+        ?: source?.stringValue("reasoningEffort")
+        ?: args.stringValue("effort")
+    val developerInstructions = sourceSettings.stringValue("developer_instructions")
+        ?: sourceSettings.stringValue("developerInstructions")
+        ?: source?.stringValue("developer_instructions")
+        ?: source?.stringValue("developerInstructions")
+
+    val settings = linkedMapOf<String, Any?>("model" to model)
+    reasoningEffort?.let { settings["reasoning_effort"] = it }
+    developerInstructions?.let { settings["developer_instructions"] = it }
+    return linkedMapOf(
+        "mode" to mode,
+        "settings" to settings
+    )
+}
+
+private fun Any?.asStringMap(): Map<String, Any?>? {
+    val raw = this as? Map<*, *> ?: return null
+    return raw.entries.associate { (key, value) -> key.toString() to value }
+}
+
+private fun String.normalizeCodexCollaborationModeKind(): String? {
+    val normalized = trim().lowercase()
+    if (normalized.isEmpty()) {
+        return null
+    }
+    return when {
+        normalized == "plan" || normalized.contains("plan") -> "plan"
+        normalized == "default" -> "default"
+        else -> normalized
+    }
 }
 
 private fun buildCodexLocalConfigPayload(
     model: String,
     baseUrl: String,
-    apiKey: String
+    apiKey: String,
+    remoteConfig: CodexRemoteBridgeConfig,
+    runtime: String
 ): Map<String, Any?> {
     return linkedMapOf(
         "codexHome" to CodexAppServerDefaults.CODEX_HOME,
         "model" to model,
         "baseUrl" to baseUrl,
-        "apiKey" to apiKey
+        "apiKey" to apiKey,
+        "remoteEnabled" to remoteConfig.enabled,
+        "remoteBridgeUrl" to remoteConfig.bridgeUrl,
+        "remoteBridgeToken" to remoteConfig.authToken,
+        "remoteCwd" to remoteConfig.cwd,
+        "remoteConfigured" to remoteConfig.isConfigured,
+        "runtime" to runtime
     )
 }
 
@@ -896,11 +1263,177 @@ private fun Map<String, Any?>.mapValue(key: String): Map<String, Any?> {
     return raw.entries.associate { (entryKey, value) -> entryKey.toString() to value }
 }
 
+private val CODEX_ENVELOPE_KEYS = listOf(
+    "message",
+    "payload",
+    "data",
+    "event",
+    "notification",
+    "params",
+    "result",
+    "_meta",
+    "msg"
+)
+
+private fun extractCodexServerMethod(value: Any?, depth: Int = 0): String {
+    val map = value as? Map<*, *> ?: return ""
+    if (depth > 6) {
+        return ""
+    }
+    val direct = normalizeCodexServerMethod(map["method"]?.toString()?.trim())
+    if (direct.isNotBlank()) {
+        return direct
+    }
+    for (key in CODEX_ENVELOPE_KEYS) {
+        val nested = extractCodexServerMethod(map[key], depth + 1)
+        if (nested.isNotBlank()) {
+            return nested
+        }
+    }
+    val rawType = map["type"]?.toString()?.trim()
+    if (codexServerTypeLooksLikeMethod(rawType)) {
+        return normalizeCodexServerMethod(rawType)
+    }
+    return ""
+}
+
+private fun codexServerTypeLooksLikeMethod(rawType: String?): Boolean {
+    val type = rawType?.trim().orEmpty()
+    if (type.isBlank()) {
+        return false
+    }
+    val normalized = normalizeCodexServerMethod(type)
+    return normalized.contains("/") ||
+        normalized == "error" ||
+        type in CODEX_THREAD_ITEM_TYPES
+}
+
+private fun extractCodexServerParams(value: Any?, depth: Int = 0): Map<String, Any?> {
+    val map = value as? Map<*, *> ?: return emptyMap()
+    if (depth > 6) {
+        return emptyMap()
+    }
+    val direct = map["params"] as? Map<*, *>
+    if (direct != null) {
+        val nested = extractCodexServerParams(direct, depth + 1)
+        if (nested.isNotEmpty()) {
+            return topLevelCodexIds(map) + nested
+        }
+        val normalized = direct.entries.associate { (entryKey, nestedValue) ->
+            entryKey.toString() to nestedValue
+        }
+        if (normalized.isNotEmpty()) {
+            return topLevelCodexIds(map) + normalized
+        }
+    }
+    for (key in CODEX_ENVELOPE_KEYS) {
+        if (key == "params") {
+            continue
+        }
+        val nested = extractCodexServerParams(map[key], depth + 1)
+        if (nested.isNotEmpty()) {
+            return topLevelCodexIds(map) + nested
+        }
+    }
+    return emptyMap()
+}
+
+private fun topLevelCodexIds(map: Map<*, *>): Map<String, Any?> {
+    val ids = linkedMapOf<String, Any?>()
+    val meta = map["_meta"] as? Map<*, *>
+    if (meta != null) {
+        for (key in listOf("threadId", "thread_id")) {
+            if (meta.containsKey(key)) {
+                ids[key] = meta[key]
+            }
+        }
+    }
+    for (key in listOf("threadId", "thread_id", "turnId", "turn_id", "itemId", "item_id")) {
+        if (map.containsKey(key)) {
+            ids[key] = map[key]
+        }
+    }
+    return ids
+}
+
+private fun normalizeCodexServerMethod(rawMethod: String?): String {
+    val method = rawMethod?.trim().orEmpty()
+    if (method.isEmpty()) {
+        return ""
+    }
+    return when (method) {
+        "thread.started" -> "thread/started"
+        "turn.started" -> "turn/started"
+        "turn.completed" -> "turn/completed"
+        "turn.failed" -> "turn/failed"
+        "item.started" -> "item/started"
+        "item.updated" -> "item/updated"
+        "item.completed" -> "item/completed"
+        else -> method
+            .replace("/agent_message/", "/agentMessage/")
+            .replace("/command_execution/", "/commandExecution/")
+            .replace("/file_change/", "/fileChange/")
+            .replace("/mcp_tool_call/", "/mcpToolCall/")
+    }
+}
+
+private fun syntheticCodexServerParams(
+    message: Map<String, Any?>,
+    method: String
+): Map<String, Any?> {
+    if (method.isBlank()) {
+        return emptyMap()
+    }
+    val payload = linkedMapOf<String, Any?>()
+    message.forEach { (key, value) ->
+        if (key != "method" && key != "type" && key != "params") {
+            payload[key] = value
+        }
+    }
+    return payload
+}
+
+private fun codexProtocolEventType(value: Any?): String {
+    val msg = codexProtocolMsg(value) ?: return ""
+    return msg["type"]?.toString()?.trim()?.lowercase()
+        ?.replace(Regex("[^a-z0-9]+"), "_")
+        .orEmpty()
+}
+
+private fun codexProtocolMsg(value: Any?, depth: Int = 0): Map<*, *>? {
+    val map = value as? Map<*, *> ?: return null
+    if (depth > 6) {
+        return null
+    }
+    val direct = map["msg"] as? Map<*, *>
+    if (direct != null) {
+        return direct
+    }
+    for (key in CODEX_ENVELOPE_KEYS) {
+        val nested = codexProtocolMsg(map[key], depth + 1)
+        if (nested != null) {
+            return nested
+        }
+    }
+    return null
+}
+
 private fun extractThreadId(value: Any?): String? {
     return extractStringRecursive(
         value = value,
         keys = setOf("threadId", "thread_id"),
-        nestedObjectKeys = setOf("thread")
+        nestedObjectKeys = setOf(
+            "thread",
+            "message",
+            "payload",
+            "data",
+            "event",
+            "notification",
+            "params",
+            "result",
+            "_meta",
+            "msg"
+        )
     )
 }
 
@@ -908,7 +1441,18 @@ private fun extractTurnId(value: Any?): String? {
     val fromTurn = extractStringRecursive(
         value = value,
         keys = setOf("turnId", "turn_id"),
-        nestedObjectKeys = setOf("turn")
+        nestedObjectKeys = setOf(
+            "turn",
+            "message",
+            "payload",
+            "data",
+            "event",
+            "notification",
+            "params",
+            "result",
+            "_meta",
+            "msg"
+        )
     )
     if (!fromTurn.isNullOrBlank()) {
         return fromTurn
@@ -916,6 +1460,128 @@ private fun extractTurnId(value: Any?): String? {
     val map = value as? Map<*, *> ?: return null
     val turn = map["turn"] as? Map<*, *> ?: return null
     return turn["id"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+}
+
+private fun extractActiveTurnId(value: Any?): String? {
+    val direct = extractStringRecursive(
+        value = value,
+        keys = setOf(
+            "turnId",
+            "turn_id",
+            "activeTurnId",
+            "active_turn_id",
+            "currentTurnId",
+            "current_turn_id"
+        ),
+        nestedObjectKeys = setOf(
+            "thread",
+            "turn",
+            "status",
+            "message",
+            "payload",
+            "data",
+            "event",
+            "notification",
+            "params",
+            "result",
+            "_meta",
+            "msg"
+        )
+    )
+    if (!direct.isNullOrBlank()) {
+        return direct
+    }
+    val root = value as? Map<*, *> ?: return null
+    val thread = root["thread"] as? Map<*, *>
+    val turns = (thread?.get("turns") as? List<*>) ?: (root["turns"] as? List<*>) ?: return null
+    for (index in turns.indices.reversed()) {
+        val turn = turns[index] as? Map<*, *> ?: continue
+        val active = codexActivityFromValue(turn["status"] ?: turn["state"])
+        if (active == true) {
+            return turn["id"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        }
+    }
+    return null
+}
+
+private fun codexThreadActivity(value: Any?): Boolean? {
+    val root = value as? Map<*, *> ?: return null
+    val thread = root["thread"] as? Map<*, *>
+    var inactiveCandidate: Boolean? = null
+    val candidates = listOf(
+        root["active"],
+        root["isActive"],
+        root["is_active"],
+        root["status"],
+        root["state"],
+        root["turnStatus"],
+        root["turn_status"],
+        thread?.get("active"),
+        thread?.get("isActive"),
+        thread?.get("is_active"),
+        thread?.get("status"),
+        thread?.get("state"),
+        thread?.get("turnStatus"),
+        thread?.get("turn_status")
+    )
+    for (candidate in candidates) {
+        val active = codexActivityFromValue(candidate)
+        if (active == true) {
+            return true
+        }
+        if (active == false) {
+            inactiveCandidate = false
+        }
+    }
+    for (key in CODEX_ENVELOPE_KEYS) {
+        val nested = root[key] as? Map<*, *> ?: continue
+        val nestedActivity = codexThreadActivity(nested)
+        if (nestedActivity == true) {
+            return true
+        }
+        if (nestedActivity == false) {
+            inactiveCandidate = false
+        }
+    }
+    val turns = (thread?.get("turns") as? List<*>) ?: (root["turns"] as? List<*>)
+    if (turns != null) {
+        for (index in turns.indices.reversed()) {
+            val turn = turns[index] as? Map<*, *> ?: continue
+            val active = codexActivityFromValue(turn["status"] ?: turn["state"])
+            if (active != null) {
+                return active
+            }
+        }
+    }
+    return inactiveCandidate
+}
+
+private fun codexActivityFromValue(value: Any?): Boolean? {
+    if (value is Boolean) {
+        return value
+    }
+    val text = codexStatusText(value)?.lowercase()
+        ?.replace(Regex("[^a-z0-9]+"), "")
+        ?: return null
+    return when (text) {
+        "running", "active", "busy", "inprogress", "inflight", "executing" -> true
+        "idle", "closed", "completed", "complete", "notloaded", "systemerror",
+        "failed", "cancelled", "canceled", "interrupted" -> false
+        else -> null
+    }
+}
+
+private fun codexStatusText(value: Any?): String? {
+    return when (value) {
+        null -> null
+        is String -> value.trim().takeIf { it.isNotEmpty() }
+        is Number, is Boolean -> value.toString()
+        is Map<*, *> -> {
+            listOf("type", "status", "state", "value", "name")
+                .firstNotNullOfOrNull { key -> codexStatusText(value[key]) }
+        }
+        else -> null
+    }
 }
 
 private fun extractThreadTitle(value: Any?): String? {
@@ -928,20 +1594,26 @@ private fun extractThreadTitle(value: Any?): String? {
         map["thread_name"],
         map["name"],
         map["title"],
+        map["preview"],
         params?.get("threadName"),
         params?.get("thread_name"),
         params?.get("name"),
         params?.get("title"),
+        params?.get("preview"),
         result?.get("threadName"),
         result?.get("thread_name"),
         result?.get("name"),
         result?.get("title"),
+        result?.get("preview"),
         thread?.get("name"),
         thread?.get("title"),
+        thread?.get("preview"),
         (params?.get("thread") as? Map<*, *>)?.get("name"),
         (result?.get("thread") as? Map<*, *>)?.get("name"),
         (params?.get("thread") as? Map<*, *>)?.get("title"),
-        (result?.get("thread") as? Map<*, *>)?.get("title")
+        (result?.get("thread") as? Map<*, *>)?.get("title"),
+        (params?.get("thread") as? Map<*, *>)?.get("preview"),
+        (result?.get("thread") as? Map<*, *>)?.get("preview")
     ).firstNotNullOfOrNull { it?.toString()?.trim()?.takeIf(String::isNotEmpty) }
 }
 
@@ -959,9 +1631,11 @@ private fun extractStringRecursive(
     }
     for (nestedKey in nestedObjectKeys) {
         val nested = map[nestedKey] as? Map<*, *>
-        val id = nested?.get("id")?.toString()?.trim()?.takeIf { it.isNotEmpty() }
-        if (id != null) {
-            return id
+        if (nestedKey == "thread" || nestedKey == "turn") {
+            val id = nested?.get("id")?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            if (id != null) {
+                return id
+            }
         }
         val recursive = extractStringRecursive(nested, keys, nestedObjectKeys)
         if (recursive != null) {
@@ -993,10 +1667,12 @@ private fun collectThreadEntries(value: Any?): List<CodexThreadListEntry> {
                     val title = listOfNotNull(
                         current["name"],
                         current["title"],
+                        current["preview"],
                         current["threadName"],
                         current["thread_name"],
                         threadMap?.get("name"),
-                        threadMap?.get("title")
+                        threadMap?.get("title"),
+                        threadMap?.get("preview")
                     ).firstNotNullOfOrNull {
                         it?.toString()?.trim()?.takeIf(String::isNotEmpty)
                     }
@@ -1090,6 +1766,15 @@ internal fun resolveCodexReviewTarget(value: Any?): Map<String, Any?> {
 
 private val THREAD_ITEM_COLLECTION_KEYS = setOf(
     "items",
+    "inputItems",
+    "input_items",
+    "outputItems",
+    "output_items",
+    "responseItems",
+    "response_items",
+    "rawItems",
+    "raw_items",
+    "events",
     "messages",
     "turns"
 )
@@ -1098,6 +1783,7 @@ private val THREAD_SUMMARY_KEYS = setOf(
     "cwd",
     "name",
     "title",
+    "preview",
     "threadName",
     "thread_name",
     "archived",
@@ -1115,12 +1801,53 @@ private val THREAD_SUMMARY_KEYS = setOf(
 
 private val CODEX_THREAD_ITEM_TYPES = setOf(
     "agentMessage",
+    "agent_message",
     "reasoning",
     "commandExecution",
+    "command_execution",
+    "local_shell_call",
+    "commandExec",
+    "processExecution",
     "fileChange",
+    "file_change",
     "tool",
     "mcpToolCall",
+    "mcp_tool_call",
+    "dynamicToolCall",
+    "dynamic_tool_call",
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "tool_search_call",
+    "tool_search_output",
+    "webSearch",
+    "web_search",
+    "web_search_call",
+    "imageView",
+    "image_view",
+    "imageGeneration",
+    "image_generation",
+    "image_generation_call",
+    "collabAgentToolCall",
+    "collab_agent_tool_call",
+    "collabToolCall",
+    "collab_tool_call",
     "userMessage",
+    "user_message",
+    "todo_list",
     "plan",
     "serverRequest"
+)
+
+internal val DEFAULT_CODEX_THREAD_SOURCE_KINDS = listOf(
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther"
 )

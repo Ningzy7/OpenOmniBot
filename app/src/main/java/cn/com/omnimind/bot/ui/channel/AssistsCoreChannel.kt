@@ -207,6 +207,9 @@ class AssistsCoreChannel {
                 "stopAgentToolCall" -> {
                     assistsCoreManager!!.stopAgentToolCall(call, result)
                 }
+                "retryAgentTask" -> {
+                    assistsCoreManager!!.retryAgentTask(call, result)
+                }
                 "isCompanionTaskRunning" -> {
                     assistsCoreManager!!.isCompanionTaskRunning( call, result)
                 }
@@ -291,6 +294,18 @@ class AssistsCoreChannel {
                 }
                 "setAutoBackToChatAfterTaskEnabled" -> {
                     assistsCoreManager!!.setAutoBackToChatAfterTaskEnabled(call, result)
+                }
+                "setPreventScreenSleepDuringTasksEnabled" -> {
+                    assistsCoreManager!!.setPreventScreenSleepDuringTasksEnabled(call, result)
+                }
+                "setTaskCompletionNotificationEnabled" -> {
+                    assistsCoreManager!!.setTaskCompletionNotificationEnabled(call, result)
+                }
+                "setVisibleChatConversation" -> {
+                    assistsCoreManager!!.setVisibleChatConversation(call, result)
+                }
+                "showTaskCompletionNotification" -> {
+                    assistsCoreManager!!.showTaskCompletionNotification(call, result)
                 }
                 "navigateToMainEngineRoute" -> {
                     assistsCoreManager!!.navigateToMainEngineRoute(call, result)

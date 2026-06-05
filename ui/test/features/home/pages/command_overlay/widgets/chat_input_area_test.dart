@@ -173,6 +173,100 @@ void main() {
     expect(selected, CodexPermissionMode.autoReview);
   });
 
+  testWidgets('codex run settings selector selects model and effort', (
+    tester,
+  ) async {
+    String? selectedModel;
+    String? selectedEffort;
+    await tester.pumpWidget(
+      _buildTestApp(
+        contextUsageRatio: null,
+        useLargeComposerStyle: true,
+        codexRunSettings: const CodexRunSettings(
+          modelId: 'gpt-5-codex',
+          reasoningEffort: 'high',
+          modelOptions: <String>['gpt-5-codex', 'gpt-5.1-codex'],
+          reasoningEffortOptions: <String>['low', 'high', 'xhigh'],
+        ),
+        onCodexRunSettingsChanged: ({modelId, reasoningEffort}) {
+          selectedModel = modelId;
+          selectedEffort = reasoningEffort;
+        },
+      ),
+    );
+    await tester.pump();
+
+    final settingsButton = find.byKey(
+      const ValueKey('chat-input-codex-run-settings-button'),
+    );
+    expect(settingsButton, findsOneWidget);
+
+    await tester.tap(settingsButton);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    await tester.tap(
+      find.byKey(
+        const ValueKey(
+          'chat-input-codex-run-settings-model-option-gpt-5.1-codex',
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(selectedModel, 'gpt-5.1-codex');
+
+    await tester.tap(settingsButton);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    await tester.tap(
+      find.byKey(
+        const ValueKey('chat-input-codex-run-settings-effort-option-xhigh'),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(selectedEffort, 'xhigh');
+  });
+
+  testWidgets('large composer codex controls fit on narrow screens', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(300, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    await tester.pumpWidget(
+      _buildTestApp(
+        contextUsageRatio: 0.72,
+        useLargeComposerStyle: true,
+        onTriggerSlashCommand: () {},
+        codexRunSettings: const CodexRunSettings(
+          modelId: 'gpt-5-codex',
+          reasoningEffort: 'xhigh',
+          modelOptions: <String>['gpt-5-codex', 'gpt-5.1-codex'],
+          reasoningEffortOptions: <String>['low', 'high', 'xhigh'],
+        ),
+        onCodexRunSettingsChanged: ({modelId, reasoningEffort}) {},
+        codexPermissionMode: CodexPermissionMode.fullAccess,
+        onCodexPermissionModeChanged: (_) {},
+      ),
+    );
+    await tester.pump();
+
+    expect(tester.takeException(), isNull);
+    expect(
+      find.byKey(const ValueKey('chat-input-codex-run-settings-button')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('chat-input-codex-permission-button')),
+      findsOneWidget,
+    );
+  });
+
   testWidgets('large composer starts collapsed for empty unfocused input', (
     tester,
   ) async {
@@ -299,6 +393,8 @@ Widget _buildTestApp({
   bool useLargeComposerStyle = false,
   CodexPermissionMode? codexPermissionMode,
   ValueChanged<CodexPermissionMode>? onCodexPermissionModeChanged,
+  CodexRunSettings? codexRunSettings,
+  CodexRunSettingsChanged? onCodexRunSettingsChanged,
   String initialText = '',
   FocusNode? focusNode,
 }) {
@@ -316,6 +412,8 @@ Widget _buildTestApp({
           contextUsageRatio: contextUsageRatio,
           onLongPressContextUsageRing: onLongPressContextUsageRing,
           onTriggerSlashCommand: onTriggerSlashCommand,
+          codexRunSettings: codexRunSettings,
+          onCodexRunSettingsChanged: onCodexRunSettingsChanged,
           codexPermissionMode: codexPermissionMode,
           onCodexPermissionModeChanged: onCodexPermissionModeChanged,
         ),

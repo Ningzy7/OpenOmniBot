@@ -85,4 +85,33 @@ class AgentRunRequestNormalizerTest {
         )
         assertTrue(normalized.attachments.single()["fileName"].toString().startsWith("image_"))
     }
+
+    @Test
+    fun `attachment blocks preserve file semantics instead of being coerced into images`() {
+        val normalized = AgentRunRequestNormalizer.normalize(
+            mapOf(
+                "content" to listOf(
+                    mapOf("type" to "text", "text" to "check this file"),
+                    mapOf(
+                        "type" to "attachment",
+                        "name" to "ezfpy_documentation.md",
+                        "path" to "/storage/emulated/0/ezfpy_documentation.md",
+                        "mimeType" to "text/markdown"
+                    )
+                )
+            )
+        )
+
+        assertEquals("check this file", normalized.userMessage)
+        assertEquals(1, normalized.attachments.size)
+        assertEquals(false, normalized.attachments.single()["isImage"])
+        assertEquals(
+            "/storage/emulated/0/ezfpy_documentation.md",
+            normalized.attachments.single()["path"]
+        )
+        assertEquals(
+            "text/markdown",
+            normalized.attachments.single()["mimeType"]
+        )
+    }
 }

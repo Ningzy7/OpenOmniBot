@@ -11,13 +11,191 @@ extension _HomeDrawerSearch on HomeDrawerState {
     if (_isSearchActive) {
       return _searchResults;
     }
+    final reservedThreadKeys = _promotedConversationThreadKeys;
     return _allConversations
-        .where((conversation) => !conversation.isArchived)
+        .where(
+          (conversation) =>
+              !conversation.isArchived &&
+              !conversation.isPinned &&
+              !reservedThreadKeys.contains(conversation.threadKey),
+        )
         .map(
           (conversation) =>
               _ConversationSearchResult(conversation: conversation),
         )
         .toList(growable: false);
+  }
+
+  Set<String> get _promotedConversationThreadKeys {
+    final keys = <String>{};
+    for (final group in _scheduledConversationGroups) {
+      keys.add(group.parent.threadKey);
+      for (final child in group.children) {
+        keys.add(child.conversation.threadKey);
+      }
+    }
+    return keys;
+  }
+
+  List<_ConversationSearchResult> get _pinnedConversationResults {
+    final reservedThreadKeys = _promotedConversationThreadKeys;
+    return _allConversations
+        .where(
+          (conversation) =>
+              !conversation.isArchived &&
+              conversation.isPinned &&
+              !reservedThreadKeys.contains(conversation.threadKey),
+        )
+        .map(
+          (conversation) =>
+              _ConversationSearchResult(conversation: conversation),
+        )
+        .toList(growable: false);
+  }
+
+  List<_ScheduledConversationGroup> get _scheduledConversationGroups {
+    final visibleConversations = _allConversations
+        .where((conversation) => !conversation.isArchived)
+        .toList(growable: false);
+    if (visibleConversations.isEmpty) {
+      return const <_ScheduledConversationGroup>[];
+    }
+
+    final conversationsByKey = <String, ConversationModel>{
+      for (final conversation in visibleConversations)
+        conversation.threadKey: conversation,
+    };
+    final parentKeys = <String>{};
+    final activeScheduledTaskIds = <String>{};
+    final activeParentKeys = <String>{};
+    final taskCountByParentKey = <String, int>{};
+
+    for (final task in _scheduledTasks) {
+      if (task.targetKind != 'subagent') {
+        continue;
+      }
+      activeScheduledTaskIds.add(task.id);
+      final parentKey = _scheduledTaskParentThreadKey(task, conversationsByKey);
+      if (parentKey == null || !conversationsByKey.containsKey(parentKey)) {
+        continue;
+      }
+      activeParentKeys.add(parentKey);
+      parentKeys.add(parentKey);
+      taskCountByParentKey[parentKey] =
+          (taskCountByParentKey[parentKey] ?? 0) + 1;
+    }
+
+    final childrenByParentKey = <String, List<_ConversationSearchResult>>{};
+    for (final conversation in visibleConversations) {
+      final parentKey = _conversationParentThreadKey(
+        conversation,
+        conversationsByKey,
+      );
+      if (parentKey == null || !conversationsByKey.containsKey(parentKey)) {
+        continue;
+      }
+      final scheduledTaskId = (conversation.scheduledTaskId ?? '').trim();
+      final belongsToActiveScheduledTask = scheduledTaskId.isNotEmpty
+          ? activeScheduledTaskIds.contains(scheduledTaskId)
+          : activeParentKeys.contains(parentKey);
+      if (!belongsToActiveScheduledTask) {
+        continue;
+      }
+      parentKeys.add(parentKey);
+      childrenByParentKey
+          .putIfAbsent(parentKey, () => <_ConversationSearchResult>[])
+          .add(_ConversationSearchResult(conversation: conversation));
+    }
+
+    final groups = <_ScheduledConversationGroup>[];
+    for (final parentKey in parentKeys) {
+      final parent = conversationsByKey[parentKey];
+      if (parent == null) {
+        continue;
+      }
+      final children =
+          childrenByParentKey[parentKey] ?? <_ConversationSearchResult>[];
+      children.sort((a, b) {
+        final byUpdatedAt = b.conversation.updatedAt.compareTo(
+          a.conversation.updatedAt,
+        );
+        if (byUpdatedAt != 0) return byUpdatedAt;
+        return b.conversation.createdAt.compareTo(a.conversation.createdAt);
+      });
+      groups.add(
+        _ScheduledConversationGroup(
+          parent: parent,
+          children: children,
+          taskCount: taskCountByParentKey[parentKey] ?? 0,
+        ),
+      );
+    }
+
+    groups.sort((a, b) {
+      final aLatest = _scheduledGroupLatestTimestamp(a);
+      final bLatest = _scheduledGroupLatestTimestamp(b);
+      final byLatest = bLatest.compareTo(aLatest);
+      if (byLatest != 0) return byLatest;
+      return b.parent.createdAt.compareTo(a.parent.createdAt);
+    });
+    return groups;
+  }
+
+  String? _scheduledTaskParentThreadKey(
+    ScheduledTask task,
+    Map<String, ConversationModel> conversationsByKey,
+  ) {
+    final rawParentId =
+        (task.parentConversationId ?? task.subagentConversationId ?? '').trim();
+    final parentId = int.tryParse(rawParentId);
+    if (parentId == null || parentId <= 0) {
+      return null;
+    }
+    if (task.parentConversationMode == null ||
+        task.parentConversationMode!.trim().isEmpty) {
+      return _threadKeyForConversationId(parentId, conversationsByKey);
+    }
+    final parentMode = ConversationMode.fromStorageValue(
+      task.parentConversationMode,
+    );
+    return '${parentMode.storageValue}:$parentId';
+  }
+
+  String? _conversationParentThreadKey(
+    ConversationModel conversation,
+    Map<String, ConversationModel> conversationsByKey,
+  ) {
+    final parentId = conversation.parentConversationId;
+    if (parentId == null || parentId <= 0) {
+      return null;
+    }
+    final parentMode = conversation.parentConversationMode;
+    if (parentMode == null) {
+      return _threadKeyForConversationId(parentId, conversationsByKey);
+    }
+    return '${parentMode.storageValue}:$parentId';
+  }
+
+  String? _threadKeyForConversationId(
+    int conversationId,
+    Map<String, ConversationModel> conversationsByKey,
+  ) {
+    for (final conversation in conversationsByKey.values) {
+      if (conversation.id == conversationId) {
+        return conversation.threadKey;
+      }
+    }
+    return null;
+  }
+
+  int _scheduledGroupLatestTimestamp(_ScheduledConversationGroup group) {
+    var latest = group.parent.updatedAt;
+    for (final child in group.children) {
+      if (child.conversation.updatedAt > latest) {
+        latest = child.conversation.updatedAt;
+      }
+    }
+    return latest;
   }
 
   Future<void> _loadConversations() async {
@@ -33,6 +211,8 @@ extension _HomeDrawerSearch on HomeDrawerState {
       final loadedConversations = await ConversationService.getAllConversations(
         includeArchived: true,
       );
+      final loadedScheduledTasks =
+          await ScheduledTaskStorageService.loadScheduledTasks();
       debugPrint(
         '[HomeDrawer] Loaded ${loadedConversations.length} conversations',
       );
@@ -47,6 +227,7 @@ extension _HomeDrawerSearch on HomeDrawerState {
       if (!mounted || generation != _conversationLoadGeneration) return;
       setState(() {
         _allConversations = loadedConversations;
+        _scheduledTasks = loadedScheduledTasks;
         isLoadingConversations = false;
       });
       _rememberConversationSnapshotCache(loadedConversations);
@@ -366,6 +547,10 @@ extension _HomeDrawerSearch on HomeDrawerState {
       conversation.updatedAt,
       conversation.messageCount,
       conversation.isArchived ? 1 : 0,
+      conversation.isPinned ? 1 : 0,
+      conversation.parentConversationId ?? '',
+      conversation.parentConversationMode?.storageValue ?? '',
+      conversation.scheduledTaskId ?? '',
       conversation.title,
       conversation.summary ?? '',
       conversation.contextSummary ?? '',

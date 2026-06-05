@@ -945,10 +945,16 @@ internal object AgentConversationHistorySupport {
         payload: Map<String, Any?>
     ): JsonElement? {
         val content = toStringAnyMap(payload["content"])
-        val text = AgentTextSanitizer.sanitizeUtf16(content["text"]?.toString().orEmpty())
         val attachments = toListOfStringAnyMap(content["attachments"])
+        val text = AgentAttachmentPromptSupport.buildUserMessageText(
+            text = content["text"]?.toString().orEmpty(),
+            attachments = attachments
+        )
         val imageBlocks = attachments.mapNotNull { attachment ->
             if (!shouldSendAttachmentToModel(attachment)) {
+                return@mapNotNull null
+            }
+            if (!AgentImageAttachmentSupport.isImageAttachment(attachment)) {
                 return@mapNotNull null
             }
             val imageUrl = resolveImageAttachmentUrl(attachment)

@@ -3,6 +3,7 @@ import 'package:ui/features/home/pages/authorize/widgets/permission_section.dart
 import 'package:ui/services/permission_service.dart';
 import 'package:ui/theme/app_colors.dart';
 import 'package:ui/theme/theme_context.dart';
+import 'package:ui/widgets/omni_glass.dart';
 
 /// 权限缺失底部弹窗
 /// 当用户在首页有权限未授权时展示
@@ -19,12 +20,16 @@ class PermissionBottomSheet extends StatefulWidget {
   /// 按钮文案（可选，默认为"开启陪伴"）
   final String buttonText;
 
+  /// 控制底部按钮是否可继续的权限 ID。为空时要求所有展示权限均已授权。
+  final Set<String> requiredPermissionIds;
+
   const PermissionBottomSheet({
     super.key,
     this.onAllAuthorized,
     required this.initialPermissions,
     required this.deviceBrand,
     this.buttonText = '开启陪伴',
+    this.requiredPermissionIds = const <String>{},
   });
 
   /// 显示权限弹窗
@@ -34,16 +39,22 @@ class PermissionBottomSheet extends StatefulWidget {
     required List<PermissionData> initialPermissions,
     required String deviceBrand,
     String buttonText = '开启陪伴',
+    Set<String> requiredPermissionIds = const <String>{},
   }) {
     return showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
+      // 玻璃面板下面如果套一层默认 scrim (Colors.black54),BackdropFilter 会把这
+      // 深色 scrim 模糊进面板,光线模式下玻璃也跟着发暗。把 barrier 调成极轻就行,
+      // 既保留"点空白处关闭"的语义,又让玻璃透出页面本身的浅色调。
+      barrierColor: Colors.black.withValues(alpha: 0.18),
       builder: (context) => PermissionBottomSheet(
         onAllAuthorized: onAllAuthorized,
         initialPermissions: initialPermissions,
         deviceBrand: deviceBrand,
         buttonText: buttonText,
+        requiredPermissionIds: requiredPermissionIds,
       ),
     );
   }
@@ -66,11 +77,18 @@ class _PermissionBottomSheetState extends State<PermissionBottomSheet>
     // 使用预加载的数据
     permissions = widget.initialPermissions;
     _isCompactMode = permissions.length >= 5;
-    allAuthorized.value = PermissionService.checkAllAuthorized(permissions);
+    allAuthorized.value = _canContinue();
   }
 
   void _checkAllAuthorized() {
-    allAuthorized.value = PermissionService.checkAllAuthorized(permissions);
+    allAuthorized.value = _canContinue();
+  }
+
+  bool _canContinue() {
+    return PermissionService.checkAuthorizedByIds(
+      permissions,
+      widget.requiredPermissionIds,
+    );
   }
 
   Future<void> _checkPermissions() async {
@@ -96,125 +114,129 @@ class _PermissionBottomSheetState extends State<PermissionBottomSheet>
     final palette = context.omniPalette;
     final isDark = context.isDarkTheme;
 
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      constraints: BoxConstraints(
-        maxHeight: MediaQuery.of(context).size.height * 0.75,
+    // 玻璃样式：保留 showModalBottomSheet 的滑出手势,只把背景换成 OmniGlassPanel。
+    // 给左右和底部都留出 12px margin,让玻璃面板看上去更像浮起的"卡片"而不是
+    // 贴边的实色 sheet (符合 iOS / Material 3 玻璃质感)。
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        12,
+        0,
+        12,
+        12 + MediaQuery.of(context).viewInsets.bottom,
       ),
-      decoration: BoxDecoration(
-        color: isDark ? palette.surfacePrimary : Colors.white,
-        borderRadius: BorderRadius.only(
-          topLeft: Radius.circular(8),
-          topRight: Radius.circular(8),
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.75,
         ),
-        border: isDark
-            ? Border(top: BorderSide(color: palette.borderSubtle))
-            : null,
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const SizedBox(height: 40),
-          // 标题区域
-          Column(
+        child: OmniGlassPanel(
+          borderRadius: BorderRadius.circular(22),
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              const SizedBox(height: 32),
+              // 标题区域
               Text(
                 Localizations.localeOf(context).languageCode == 'en'
                     ? 'Please check the permissions below'
                     : '请检查下列权限',
                 style: TextStyle(
-                  color: isDark ? null : AppColors.text,
+                  color: isDark ? palette.textPrimary : AppColors.text,
                   fontSize: 20,
                   fontWeight: FontWeight.w600,
                   height: 1.5,
                 ),
               ),
-            ],
-          ),
-          const SizedBox(height: 30),
-          // 权限列表
-          Flexible(
-            child: SingleChildScrollView(
-              child: PermissionSection(
-                spacing: _isCompactMode ? 26 : 40,
-                permissions: permissions,
-                onPermissionChanged: _checkPermissions,
+              const SizedBox(height: 26),
+              // 权限列表
+              Flexible(
+                child: SingleChildScrollView(
+                  child: PermissionSection(
+                    spacing: _isCompactMode ? 26 : 36,
+                    permissions: permissions,
+                    onPermissionChanged: _checkPermissions,
+                  ),
+                ),
               ),
-            ),
-          ),
-          SizedBox(height: _isCompactMode ? 26 : 40),
-          // 底部按钮
-          Center(
-            child: ValueListenableBuilder<bool>(
-              valueListenable: allAuthorized,
-              builder: (context, authorized, child) {
-                return GestureDetector(
-                  onTap: () {
-                    if (authorized) {
-                      // 所有权限已授权，关闭弹窗并执行回调
-                      Navigator.of(context).pop();
-                      widget.onAllAuthorized?.call();
-                    }
-                  },
-                  child: Opacity(
-                    opacity: authorized ? 1.0 : 0.5,
-                    child: Container(
-                      width: double.infinity,
-                      constraints: const BoxConstraints(maxWidth: 288),
-                      height: 48,
-                      decoration: BoxDecoration(
-                        gradient: isDark
-                            ? LinearGradient(
-                                begin: const Alignment(0.14, -1.09),
-                                end: const Alignment(1.10, 1.26),
-                                colors: [
-                                  Color.lerp(
-                                    palette.surfaceElevated,
-                                    palette.accentPrimary,
-                                    0.18,
-                                  )!,
-                                  Color.lerp(
-                                    palette.surfaceSecondary,
-                                    palette.accentPrimary,
-                                    0.34,
-                                  )!,
-                                ],
-                              )
-                            : const LinearGradient(
-                                begin: Alignment(0.14, -1.09),
-                                end: Alignment(1.10, 1.26),
-                                colors: [Color(0xFF1930D9), Color(0xFF2CA5F0)],
+              SizedBox(height: _isCompactMode ? 24 : 32),
+              // 底部按钮
+              Center(
+                child: ValueListenableBuilder<bool>(
+                  valueListenable: allAuthorized,
+                  builder: (context, authorized, child) {
+                    return GestureDetector(
+                      onTap: () {
+                        if (authorized) {
+                          Navigator.of(context).pop();
+                          widget.onAllAuthorized?.call();
+                        }
+                      },
+                      child: Opacity(
+                        opacity: authorized ? 1.0 : 0.5,
+                        child: Container(
+                          width: double.infinity,
+                          constraints: const BoxConstraints(maxWidth: 288),
+                          height: 48,
+                          decoration: BoxDecoration(
+                            gradient: isDark
+                                ? LinearGradient(
+                                    begin: const Alignment(0.14, -1.09),
+                                    end: const Alignment(1.10, 1.26),
+                                    colors: [
+                                      Color.lerp(
+                                        palette.surfaceElevated,
+                                        palette.accentPrimary,
+                                        0.18,
+                                      )!,
+                                      Color.lerp(
+                                        palette.surfaceSecondary,
+                                        palette.accentPrimary,
+                                        0.34,
+                                      )!,
+                                    ],
+                                  )
+                                : const LinearGradient(
+                                    begin: Alignment(0.14, -1.09),
+                                    end: Alignment(1.10, 1.26),
+                                    colors: [
+                                      Color(0xFF1930D9),
+                                      Color(0xFF2CA5F0),
+                                    ],
+                                  ),
+                            borderRadius: BorderRadius.circular(12),
+                            border: isDark
+                                ? Border.all(color: palette.borderSubtle)
+                                : null,
+                          ),
+                          child: Center(
+                            child: Text(
+                              Localizations.localeOf(context).languageCode ==
+                                          'en' &&
+                                      widget.buttonText == '开启陪伴'
+                                  ? 'Enable Companion'
+                                  : widget.buttonText,
+                              style: TextStyle(
+                                color: isDark
+                                    ? palette.textPrimary
+                                    : Colors.white,
+                                fontSize: 16,
+                                fontFamily: 'PingFang SC',
+                                fontWeight: FontWeight.w600,
+                                height: 1.5,
                               ),
-                        borderRadius: BorderRadius.circular(8),
-                        border: isDark
-                            ? Border.all(color: palette.borderSubtle)
-                            : null,
-                      ),
-                      child: Center(
-                        child: Text(
-                          Localizations.localeOf(context).languageCode == 'en' &&
-                                  widget.buttonText == '开启陪伴'
-                              ? 'Enable Companion'
-                              : widget.buttonText,
-                          style: TextStyle(
-                            color: isDark ? palette.textPrimary : Colors.white,
-                            fontSize: 16,
-                            fontFamily: 'PingFang SC',
-                            fontWeight: FontWeight.w600,
-                            height: 1.5,
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                  ),
-                );
-              },
-            ),
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(height: 28),
+            ],
           ),
-          const SizedBox(height: 40),
-        ],
+        ),
       ),
     );
   }

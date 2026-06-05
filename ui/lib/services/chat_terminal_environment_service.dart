@@ -1,5 +1,6 @@
 import 'dart:collection';
 
+import 'package:flutter/services.dart';
 import 'package:ui/services/storage_service.dart';
 
 class ChatTerminalEnvironmentVariable {
@@ -27,6 +28,9 @@ class ChatTerminalEnvironmentVariable {
 
 class ChatTerminalEnvironmentService {
   static const String _storageKey = 'chat_terminal_environment_variables';
+  static const MethodChannel _nativeChannel = MethodChannel(
+    'cn.com.omnimind.bot/SpecialPermissionEvent',
+  );
   static final RegExp _envKeyPattern = RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$');
 
   static bool isValidKey(String value) {
@@ -51,6 +55,23 @@ class ChatTerminalEnvironmentService {
       _storageKey,
       normalized.map((item) => item.toMap()).toList(),
     );
+    await syncNativeVariables(normalized);
+  }
+
+  static Future<void> syncNativeVariables(
+    List<ChatTerminalEnvironmentVariable> variables,
+  ) async {
+    final normalized = normalizeVariables(variables);
+    try {
+      await _nativeChannel.invokeMethod<Object?>(
+        'syncTerminalEnvironmentVariables',
+        <String, dynamic>{
+          'variables': normalized.map((item) => item.toMap()).toList(),
+        },
+      );
+    } on MissingPluginException {
+      // Flutter unit tests and web builds do not have the Android channel.
+    }
   }
 
   static List<ChatTerminalEnvironmentVariable> normalizeVariables(

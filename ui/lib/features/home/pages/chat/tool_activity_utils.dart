@@ -4,6 +4,7 @@ import 'package:ui/features/home/pages/chat/utils/agent_run_timeline.dart';
 import 'package:ui/features/home/pages/command_overlay/widgets/cards/terminal_output_utils.dart';
 import 'package:ui/l10n/legacy_text_localizer.dart';
 import 'package:ui/models/chat_message_model.dart';
+import 'package:ui/services/codex_diff_parser.dart';
 
 const String kAgentToolSummaryCardType = 'agent_tool_summary';
 const String kAgentToolTitleField = 'toolTitle';
@@ -291,6 +292,21 @@ String resolveAgentToolPreview(Map<String, dynamic> cardData) {
       return output;
     }
   }
+  if (toolType == 'file') {
+    final additions = _asNonNegativeInt(cardData['additions']);
+    final deletions = _asNonNegativeInt(cardData['deletions']);
+    final changedFiles = _asNonNegativeInt(cardData['changedFiles']);
+    if (changedFiles > 0 || additions > 0 || deletions > 0) {
+      final fileLabel = changedFiles <= 1
+          ? LegacyTextLocalizer.localize('1 个文件')
+          : LegacyTextLocalizer.localize('$changedFiles 个文件');
+      return '$fileLabel · ${formatCodexDiffStat(additions: additions, deletions: deletions)}';
+    }
+    final filePath = (cardData['filePath'] ?? '').toString().trim();
+    if (filePath.isNotEmpty) {
+      return filePath;
+    }
+  }
 
   final progress = (cardData['progress'] ?? '').toString().trim();
   final summary = (cardData['summary'] ?? '').toString().trim();
@@ -325,8 +341,11 @@ String resolveAgentToolStatusLabel(Map<String, dynamic> cardData) {
     default:
       if (toolType == 'terminal') return LegacyTextLocalizer.localize('运行中');
       if (toolType == 'browser') return LegacyTextLocalizer.localize('浏览中');
+      if (toolType == 'search') return LegacyTextLocalizer.localize('搜索中');
+      if (toolType == 'image') return LegacyTextLocalizer.localize('查看中');
       if (toolType == 'mcp') return LegacyTextLocalizer.localize('响应中');
       if (toolType == 'memory') return LegacyTextLocalizer.localize('处理中');
+      if (toolType == 'review') return LegacyTextLocalizer.localize('审阅中');
       return LegacyTextLocalizer.localize('执行中');
   }
 }
@@ -341,8 +360,20 @@ String resolveAgentToolTypeLabel(Map<String, dynamic> cardData) {
       return LegacyTextLocalizer.localize('终端');
     case 'browser':
       return LegacyTextLocalizer.localize('浏览器');
+    case 'search':
+      return LegacyTextLocalizer.localize('搜索');
+    case 'image':
+      return LegacyTextLocalizer.localize('图像');
     case 'workspace':
       return LegacyTextLocalizer.localize('工作区');
+    case 'file':
+      return LegacyTextLocalizer.localize('文件');
+    case 'plan':
+      return LegacyTextLocalizer.localize('计划');
+    case 'account':
+      return LegacyTextLocalizer.localize('账户');
+    case 'status':
+      return LegacyTextLocalizer.localize('状态');
     case 'schedule':
       return LegacyTextLocalizer.localize('定时');
     case 'alarm':
@@ -355,6 +386,8 @@ String resolveAgentToolTypeLabel(Map<String, dynamic> cardData) {
       return 'Skill';
     case 'subagent':
       return LegacyTextLocalizer.localize('子任务');
+    case 'review':
+      return LegacyTextLocalizer.localize('审阅');
     case 'mcp':
       return 'MCP';
     default:
@@ -422,8 +455,52 @@ String _extractToolTitleFromArgs(String argsJson) {
     if (decoded is! Map) {
       return '';
     }
-    return (decoded['tool_title'] ?? '').toString().trim();
+    final map = decoded.map((key, value) => MapEntry(key.toString(), value));
+    final explicit = (map['tool_title'] ?? map['toolTitle'] ?? '')
+        .toString()
+        .trim();
+    if (explicit.isNotEmpty) {
+      return explicit;
+    }
+    for (final key in const <String>[
+      'command',
+      'cmd',
+      'query',
+      'q',
+      'url',
+      'path',
+      'filePath',
+      'file_path',
+    ]) {
+      final value = map[key]?.toString().trim() ?? '';
+      if (value.isNotEmpty) {
+        return _compactToolTitle(value);
+      }
+    }
   } catch (_) {
     return '';
   }
+  return '';
+}
+
+String _compactToolTitle(String value) {
+  final normalized = value
+      .trim()
+      .split('\n')
+      .first
+      .trim()
+      .replaceAll(RegExp(r'\s+'), ' ');
+  if (normalized.length <= 48) {
+    return normalized;
+  }
+  return '${normalized.substring(0, 48)}...';
+}
+
+int _asNonNegativeInt(dynamic value) {
+  final parsed = value is int
+      ? value
+      : value is num
+      ? value.toInt()
+      : int.tryParse(value?.toString() ?? '') ?? 0;
+  return parsed < 0 ? 0 : parsed;
 }

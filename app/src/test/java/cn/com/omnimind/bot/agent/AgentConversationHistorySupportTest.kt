@@ -643,6 +643,31 @@ class AgentConversationHistorySupportTest {
     }
 
     @Test
+    fun `buildPromptSeedFromEntries keeps non-image attachments as workspace path hints`() {
+        val entry = buildUserEntry(
+            id = 1,
+            entryId = "u-doc",
+            text = "你看看这个",
+            attachments = listOf(
+                mapOf(
+                    "path" to "/data/user/0/cn.com.omnimind.bot/workspace/.omnibot/shared/doc.md",
+                    "name" to "doc.md",
+                    "mimeType" to "text/markdown",
+                    "isImage" to false,
+                    "promptPath" to "/workspace/shared/doc.md",
+                    "sendToModel" to false
+                )
+            )
+        )
+
+        val seed = AgentConversationHistorySupport.buildPromptSeedFromEntries(listOf(entry))
+        val content = seed.historyMessages.single().content!!.jsonPrimitive.content
+
+        assertTrue(content.contains("doc.md"))
+        assertTrue(content.contains("/workspace/shared/doc.md"))
+    }
+
+    @Test
     fun `selectEntriesToCompact includes historical tool context before latest user`() {
         val entries = listOf(
             buildUserEntry(id = 1, entryId = "u1", text = "第一轮问题"),

@@ -14,10 +14,12 @@ import 'package:ui/features/home/widgets/home_drawer_search_field.dart';
 import 'package:ui/models/chat_message_model.dart';
 import 'package:ui/models/conversation_model.dart';
 import 'package:ui/models/conversation_thread_target.dart';
+import 'package:ui/models/scheduled_task.dart';
 import 'package:ui/services/assists_core_service.dart';
 import 'package:ui/services/conversation_history_service.dart';
 import 'package:ui/services/conversation_service.dart';
 import 'package:ui/services/omnibot_resource_service.dart';
+import 'package:ui/services/scheduled_task_storage_service.dart';
 import 'package:ui/services/storage_service.dart';
 import 'package:ui/theme/app_colors.dart';
 import 'package:ui/theme/theme_context.dart';
@@ -119,7 +121,6 @@ class HomeDrawerState extends ConsumerState<HomeDrawer> {
       <String, String>{};
   static Map<String, Set<String>> _conversationImagePreviewFailureSnapshot =
       <String, Set<String>>{};
-
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
   final Map<String, _ConversationSearchIndex> _conversationSearchCache =
@@ -146,8 +147,10 @@ class HomeDrawerState extends ConsumerState<HomeDrawer> {
   int _searchGeneration = 0;
   Timer? _searchDebounceTimer;
   String? _editingThreadKey;
+  List<ScheduledTask> _scheduledTasks = <ScheduledTask>[];
   StreamSubscription<Map<String, dynamic>>?
   _conversationListChangedSubscription;
+  StreamSubscription<List<ScheduledTask>>? _scheduledTasksChangedSubscription;
 
   @override
   void initState() {
@@ -155,12 +158,16 @@ class HomeDrawerState extends ConsumerState<HomeDrawer> {
     _searchController.addListener(_handleSearchQueryChanged);
     _searchFocusNode.addListener(_handleSearchFocusChanged);
     _titleEditingFocusNode.addListener(_handleTitleEditingFocusChanged);
+    _restoreExpandedConversationSections();
     _restoreDrawerSnapshotCache();
     _conversationListChangedSubscription = AssistsMessageService
         .conversationListChangedStream
         .listen((_) {
           unawaited(_loadConversations());
         });
+    _scheduledTasksChangedSubscription = ScheduledTaskStorageService
+        .scheduledTasksChangedStream
+        .listen(_handleScheduledTasksChanged);
     _loadConversations();
   }
 
@@ -168,6 +175,7 @@ class HomeDrawerState extends ConsumerState<HomeDrawer> {
   void dispose() {
     _searchDebounceTimer?.cancel();
     _conversationListChangedSubscription?.cancel();
+    _scheduledTasksChangedSubscription?.cancel();
     _searchController
       ..removeListener(_handleSearchQueryChanged)
       ..dispose();
@@ -179,6 +187,18 @@ class HomeDrawerState extends ConsumerState<HomeDrawer> {
       ..dispose();
     _titleEditingController.dispose();
     super.dispose();
+  }
+
+  void _handleScheduledTasksChanged(List<ScheduledTask> tasks) {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _scheduledTasks = List<ScheduledTask>.from(tasks);
+    });
+    if (_isSearchActive) {
+      _scheduleConversationSearch(immediate: true);
+    }
   }
 
   void reloadConversations() {
@@ -195,8 +215,6 @@ class HomeDrawerState extends ConsumerState<HomeDrawer> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const SizedBox(height: 16),
-            _buildUserHeader(),
-            const SizedBox(height: 20),
             Expanded(child: _buildConversationSection()),
             const SizedBox(height: 12),
             _buildFooterShortcutBar(),

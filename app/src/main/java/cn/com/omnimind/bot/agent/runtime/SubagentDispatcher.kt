@@ -37,7 +37,9 @@ class SubagentDispatcher(
     private val toolExecutorProvider: () -> AgentToolExecutor,
     private val parentCatalogProvider: () -> AgentToolCatalog,
     private val eventAdapter: AgentEventAdapter,
-    private val model: String
+    private val model: String,
+    private val toolImageContinuationPolicy: AgentToolImageContinuationPolicy =
+        AgentToolImageContinuationPolicy.DEFAULT
 ) {
 
     data class SubagentTaskSpec(
@@ -176,7 +178,8 @@ class SubagentDispatcher(
                 toolRegistry = filteredCatalog,
                 toolRouter = toolExecutorProvider(),
                 eventAdapter = eventAdapter,
-                model = model
+                model = model,
+                toolImageContinuationPolicy = toolImageContinuationPolicy
             )
             val result = orchestrator.run(
                 AgentOrchestrator.Input(

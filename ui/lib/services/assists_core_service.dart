@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:ui/models/agent_stream_event.dart';
 import 'package:ui/services/agent_schedule_bridge_service.dart';
 import 'package:ui/services/app_state_service.dart';
+import 'package:ui/services/codex_tool_call_parser.dart';
 
 // 卡片推送
 typedef CardPushCallback<T> = void Function(Map<String, dynamic> cardData);
@@ -97,6 +98,7 @@ class AgentToolEventData {
   final String displayName;
   final String toolTitle;
   final String toolType;
+  final String uiStyle;
   final String? serverName;
   final String status;
   final String argsJson;
@@ -108,6 +110,7 @@ class AgentToolEventData {
   final String terminalOutputDelta;
   final String? terminalSessionId;
   final String terminalStreamState;
+  final Map<String, dynamic> raw;
   final String? workspaceId;
   final String? interruptedBy;
   final String? interruptionReason;
@@ -124,6 +127,7 @@ class AgentToolEventData {
     required this.displayName,
     this.toolTitle = '',
     required this.toolType,
+    this.uiStyle = '',
     this.serverName,
     this.status = '',
     this.argsJson = '',
@@ -135,6 +139,7 @@ class AgentToolEventData {
     this.terminalOutputDelta = '',
     this.terminalSessionId,
     this.terminalStreamState = '',
+    this.raw = const <String, dynamic>{},
     this.workspaceId,
     this.interruptedBy,
     this.interruptionReason,
@@ -146,25 +151,56 @@ class AgentToolEventData {
   });
 
   factory AgentToolEventData.fromMap(Map<dynamic, dynamic>? map) {
-    final raw = map ?? const {};
+    final raw = Map<String, dynamic>.from(
+      (map ?? const <dynamic, dynamic>{}).map(
+        (key, value) => MapEntry(key.toString(), value),
+      ),
+    );
+    final itemType = _asNonEmptyString(raw['type']);
+    final normalized = normalizeCodexToolCall(
+      raw,
+      itemType: itemType,
+      fallbackToolType: _asNonEmptyString(raw['toolType']) ?? 'builtin',
+      fallbackTitle:
+          _asNonEmptyString(raw['toolTitle']) ??
+          _asNonEmptyString(raw['displayName']),
+      fallbackStatus: _asNonEmptyString(raw['status']) ?? '',
+    );
+    final explicitStatus = codexToolStatusIsExplicit(raw);
+    final isCodexTool = itemType != null && isCodexToolItemType(itemType);
     return AgentToolEventData(
       taskId: (raw['taskId'] ?? '').toString(),
       cardId: (raw['cardId'] ?? '').toString(),
-      toolName: (raw['toolName'] ?? '').toString(),
-      displayName: (raw['displayName'] ?? raw['toolName'] ?? '').toString(),
-      toolTitle: (raw['toolTitle'] ?? '').toString(),
-      toolType: (raw['toolType'] ?? 'builtin').toString(),
-      serverName: raw['serverName']?.toString(),
-      status: (raw['status'] ?? '').toString(),
-      argsJson: (raw['argsJson'] ?? raw['args'] ?? '').toString(),
-      progress: (raw['progress'] ?? '').toString(),
-      summary: (raw['summary'] ?? '').toString(),
-      resultPreviewJson: (raw['resultPreviewJson'] ?? '').toString(),
-      rawResultJson: (raw['rawResultJson'] ?? '').toString(),
-      terminalOutput: (raw['terminalOutput'] ?? '').toString(),
+      toolName: _asNonEmptyString(raw['toolName']) ?? normalized.toolName,
+      displayName:
+          _asNonEmptyString(raw['displayName']) ??
+          _asNonEmptyString(raw['toolName']) ??
+          normalized.displayName,
+      toolTitle: _asNonEmptyString(raw['toolTitle']) ?? normalized.toolTitle,
+      toolType: _asNonEmptyString(raw['toolType']) ?? normalized.toolType,
+      uiStyle:
+          _asNonEmptyString(raw['uiStyle']) ??
+          _asNonEmptyString(raw['ui_style']) ??
+          (isCodexTool ? 'codex_tool' : ''),
+      serverName: _asNonEmptyString(raw['serverName']) ?? normalized.serverName,
+      status: explicitStatus ? normalized.status : '',
+      argsJson:
+          _asNonEmptyString(raw['argsJson']) ??
+          (raw['args'] is String ? _asNonEmptyString(raw['args']) : null) ??
+          normalized.argsJson,
+      progress: _asNonEmptyString(raw['progress']) ?? normalized.progress,
+      summary: _asNonEmptyString(raw['summary']) ?? normalized.summary,
+      resultPreviewJson:
+          _asNonEmptyString(raw['resultPreviewJson']) ??
+          normalized.resultPreviewJson,
+      rawResultJson:
+          _asNonEmptyString(raw['rawResultJson']) ?? normalized.rawResultJson,
+      terminalOutput:
+          _asNonEmptyString(raw['terminalOutput']) ?? normalized.terminalOutput,
       terminalOutputDelta: (raw['terminalOutputDelta'] ?? '').toString(),
       terminalSessionId: raw['terminalSessionId']?.toString(),
       terminalStreamState: (raw['terminalStreamState'] ?? '').toString(),
+      raw: raw,
       workspaceId: raw['workspaceId']?.toString(),
       interruptedBy: raw['interruptedBy']?.toString(),
       interruptionReason: raw['interruptionReason']?.toString(),
@@ -182,6 +218,11 @@ class AgentToolEventData {
       ),
       success: raw['success'] != false,
     );
+  }
+
+  static String? _asNonEmptyString(dynamic value) {
+    final text = value?.toString().trim() ?? '';
+    return text.isEmpty ? null : text;
   }
 
   static List<Map<String, dynamic>> _readSubagentEvents(dynamic value) {
@@ -672,6 +713,19 @@ class AssistsMessageService {
       return result == "SUCCESS";
     } on PlatformException catch (e) {
       print('停止工具调用失败: ${e.message}');
+      return false;
+    }
+  }
+
+  static Future<bool> retryAgentTask({required String taskId}) async {
+    try {
+      final result = await assistCore.invokeMethod(
+        'retryAgentTask',
+        <String, String>{'taskId': taskId},
+      );
+      return result == "SUCCESS";
+    } on PlatformException catch (e) {
+      print('retryAgentTask failed: ${e.message}');
       return false;
     }
   }
@@ -1446,6 +1500,78 @@ class AssistsMessageService {
       return result == 'SUCCESS';
     } on PlatformException catch (e) {
       print('同步自动回聊天设置失败: ${e.message}');
+      return false;
+    }
+  }
+
+  static Future<bool> setPreventScreenSleepDuringTasksEnabled(
+    bool enabled,
+  ) async {
+    try {
+      final result = await assistCore.invokeMethod<String>(
+        'setPreventScreenSleepDuringTasksEnabled',
+        {'enabled': enabled},
+      );
+      return result == 'SUCCESS';
+    } on PlatformException catch (e) {
+      print('Failed to sync prevent sleep setting: ${e.message}');
+      return false;
+    }
+  }
+
+  static Future<bool> setTaskCompletionNotificationEnabled(bool enabled) async {
+    try {
+      final result = await assistCore.invokeMethod<String>(
+        'setTaskCompletionNotificationEnabled',
+        {'enabled': enabled},
+      );
+      return result == 'SUCCESS';
+    } on PlatformException catch (e) {
+      print('Failed to sync task completion notification setting: ${e.message}');
+      return false;
+    }
+  }
+
+  static Future<bool> setVisibleChatConversation({
+    int? conversationId,
+    String? conversationMode,
+    bool visible = true,
+  }) async {
+    try {
+      final result = await assistCore.invokeMethod<String>(
+        'setVisibleChatConversation',
+        {
+          'conversationId': conversationId ?? 0,
+          'visible': visible,
+          if (conversationMode != null) 'mode': conversationMode,
+        },
+      );
+      return result == 'SUCCESS';
+    } on PlatformException catch (e) {
+      print('Failed to sync visible chat conversation: ${e.message}');
+      return false;
+    }
+  }
+
+  static Future<bool> showTaskCompletionNotification({
+    required String title,
+    required String message,
+    int? conversationId,
+    String? conversationMode,
+  }) async {
+    try {
+      final result = await assistCore.invokeMethod<String>(
+        'showTaskCompletionNotification',
+        {
+          'title': title,
+          'message': message,
+          if (conversationId != null) 'conversationId': conversationId,
+          if (conversationMode != null) 'conversationMode': conversationMode,
+        },
+      );
+      return result == 'SUCCESS';
+    } on PlatformException catch (e) {
+      print('Failed to show task completion notification: ${e.message}');
       return false;
     }
   }

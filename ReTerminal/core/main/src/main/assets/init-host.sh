@@ -20,11 +20,28 @@ if [ -n "$OMNIBOT_HOST_WORKSPACE" ]; then
     mkdir -p "$ALPINE_DIR/workspace"
 fi
 
-[ ! -e "$PREFIX/local/bin/proot" ] && cp "$PREFIX/files/proot" "$PREFIX/local/bin"
+if [ -n "$OMNIBOT_MT_STORAGE_HOST" ] && [ -d "$OMNIBOT_MT_STORAGE_HOST" ]; then
+    mkdir -p "$ALPINE_DIR/mnt/mt" "$ALPINE_DIR/mt"
+fi
+
+mkdir -p "$PREFIX/local/bin" "$PREFIX/local/lib"
+
+install_runtime_file() {
+    src="$1"
+    dest="$2"
+    mode="$3"
+    [ -e "$src" ] || return 0
+    tmp="${dest}.$$"
+    rm -f "$tmp"
+    cp "$src" "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$dest"
+}
+
+install_runtime_file "$PREFIX/files/proot" "$PREFIX/local/bin/proot" 755
 
 for sofile in "$PREFIX/files/"*.so.2; do
+    [ -e "$sofile" ] || continue
     dest="$PREFIX/local/lib/$(basename "$sofile")"
-    [ ! -e "$dest" ] && cp "$sofile" "$dest"
+    install_runtime_file "$sofile" "$dest" 644
 done
 
 
@@ -56,6 +73,11 @@ ARGS="$ARGS -b $FIPS_COMPAT_FILE:/proc/.sysctl_crypto_fips_enabled"
 
 if [ -n "$OMNIBOT_HOST_WORKSPACE" ]; then
   ARGS="$ARGS -b $OMNIBOT_HOST_WORKSPACE:/workspace"
+fi
+
+if [ -n "$OMNIBOT_MT_STORAGE_HOST" ] && [ -d "$OMNIBOT_MT_STORAGE_HOST" ]; then
+  ARGS="$ARGS -b $OMNIBOT_MT_STORAGE_HOST:/mnt/mt"
+  ARGS="$ARGS -b $OMNIBOT_MT_STORAGE_HOST:/mt"
 fi
 
 if [ -e "/proc/self/fd" ]; then

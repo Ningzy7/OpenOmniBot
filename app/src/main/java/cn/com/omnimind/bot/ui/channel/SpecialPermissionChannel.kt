@@ -155,6 +155,8 @@ class SpecialPermissionChannel {
                         .deleteEmbeddedTerminalAutoStartTask(call, result)
                     "runEmbeddedTerminalAutoStartTask" -> specialPermissionManager!!
                         .runEmbeddedTerminalAutoStartTask(call, result)
+                    "syncTerminalEnvironmentVariables" -> specialPermissionManager!!
+                        .syncTerminalEnvironmentVariables(call, result)
                     "openNativeTerminal" -> specialPermissionManager!!
                         .openNativeTerminal(call, result)
                     "prepareTermuxLiveWrapper" -> specialPermissionManager!!

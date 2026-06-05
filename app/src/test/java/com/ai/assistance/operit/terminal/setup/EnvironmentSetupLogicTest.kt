@@ -67,9 +67,48 @@ class EnvironmentSetupLogicTest {
     fun buildInventoryProbeCommand_codexChecksVersionAndAppServer() {
         val command = EnvironmentSetupLogic.buildInventoryProbeCommand(listOf("codex"))
 
+        assertTrue(command.contains("cd /root"))
+        assertTrue(command.contains("/bin/pwd"))
         assertTrue(command.contains("command -v codex"))
         assertTrue(command.contains("codex app-server --help"))
         assertTrue(command.contains("codex --version"))
+    }
+
+    @Test
+    fun buildInventoryProbeCommand_validatesRuntimeCwdForNodeAndPython() {
+        val command = EnvironmentSetupLogic.buildInventoryProbeCommand(listOf("nodejs", "python", "pip"))
+
+        assertTrue(command.contains("node -e 'process.cwd()'"))
+        assertTrue(command.contains("python3 -c 'import os; os.getcwd()'"))
+        assertTrue(command.contains("pip3 --version"))
+    }
+
+    @Test
+    fun buildSetupScript_validatesSelectedPackagesBeforeSuccess() {
+        val commands = EnvironmentSetupLogic.buildInstallCommands(
+            selectedPackageIds = listOf("nodejs", "python", "pip"),
+            repositorySetupCommand = ""
+        )
+        val script = EnvironmentSetupLogic.buildSetupScript(
+            commands = commands,
+            selectedPackageIds = listOf("nodejs", "python", "pip")
+        )
+
+        assertTrue(script.contains("run_validate()"))
+        assertTrue(script.contains("校验基础目录操作"))
+        assertTrue(script.contains("node -e 'process.cwd()'"))
+        assertTrue(script.contains("python3 -c 'import os; os.getcwd()'"))
+        assertTrue(script.contains("pip3 --version"))
+        assertTrue(script.indexOf("run_setup && run_validate") < script.indexOf("选中的环境已准备完成"))
+    }
+
+    @Test
+    fun buildValidationCommands_wrapsChecksForAndJoinedExecution() {
+        val commands = EnvironmentSetupLogic.buildValidationCommands(listOf("nodejs"))
+
+        assertTrue(commands.isNotEmpty())
+        assertTrue(commands.all { it.startsWith("{ ") && it.endsWith("; }") })
+        assertTrue(commands.any { it.contains("exit 1") })
     }
 
     @Test
@@ -88,7 +127,7 @@ class EnvironmentSetupLogicTest {
                     repositorySetupCommand = ""
                 )
                 val scriptFile = File(tempDir, "setup-$mask.sh")
-                scriptFile.writeText(EnvironmentSetupLogic.buildSetupScript(commands))
+                scriptFile.writeText(EnvironmentSetupLogic.buildSetupScript(commands, selectedPackageIds))
 
                 val process = ProcessBuilder("/bin/sh", "-n", scriptFile.absolutePath)
                     .redirectErrorStream(true)

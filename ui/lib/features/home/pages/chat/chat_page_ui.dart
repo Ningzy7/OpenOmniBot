@@ -16,6 +16,7 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
   static const double _kChatInputFallbackHeight = 80.0;
   static const double _kHdPadPaneCollapseWidthRatio = 0.12;
   static const double _kHdPadPaneCollapseMinWidthFactor = 0.72;
+  final Set<String> _pendingManualAgentRetryTaskIds = <String>{};
 
   ChatPageMode get _primaryChatMessagePageMode =>
       _activeMode == ChatPageMode.codex
@@ -845,6 +846,7 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
     return ChatMessageList(
       messages: resolvedMessages,
       activeAgentTaskIds: activeAgentTaskIds,
+      onRetryAgentMessage: _retryFailedAgentTurn,
       expandedAgentRunTaskIds: _expandedAgentRunTaskIdsForMode(mode),
       onExpandedAgentRunTaskIdsChanged: (taskIds) {
         _updateExpandedAgentRunTaskIds(mode, taskIds);
@@ -855,6 +857,12 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
       emptyGreetingPinnedQuickPromptIds:
           homeGreetingSettings.pinnedQuickPromptIds,
       onQuickPromptSelected: _applyHomeQuickPrompt,
+      emptyGreetingCodexWorkspaceName: mode == ChatPageMode.codex
+          ? _codexRemoteWorkspaceNameForGreeting()
+          : null,
+      onEmptyGreetingCodexWorkspaceTap: mode == ChatPageMode.codex
+          ? () => unawaited(_openCodexRemoteWorkspacePicker())
+          : null,
       scrollController: _scrollControllerForMode(mode),
       bottomOverlayInset:
           bottomOverlayInset +
@@ -889,6 +897,12 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
 
   @override
   Widget _buildWorkspaceSurfacePage() {
+    if (_shouldUseRemoteCodexWorkspace()) {
+      return _buildRemoteCodexWorkspaceBrowser(
+        translucentSurfaces: AppBackgroundService.current.isActive,
+        enableSystemBackHandler: true,
+      );
+    }
     final workspacePathsFuture = _workspacePathsLoadFuture ??=
         OmnibotResourceService.ensureWorkspacePathsLoaded();
     return FutureBuilder<OmnibotWorkspacePaths>(
@@ -919,6 +933,97 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
           },
         );
       },
+    );
+  }
+
+  bool _shouldUseRemoteCodexWorkspace() {
+    if (_activeMode != ChatPageMode.codex) {
+      return false;
+    }
+    final runtime = _codexStatus.runtime?.trim();
+    return runtime == 'remote' || _codexStatus.remoteEnabled;
+  }
+
+  Widget _buildRemoteCodexWorkspaceBrowser({
+    Key? key,
+    required bool translucentSurfaces,
+    required bool enableSystemBackHandler,
+  }) {
+    final workspacePath = (_codexStatus.remoteCwd ?? _codexStatus.cwd ?? '')
+        .trim();
+    final bridgeUrl = (_codexStatus.remoteBridgeUrl ?? '').trim();
+    if (workspacePath.isEmpty) {
+      return _buildRemoteCodexWorkspaceUnavailable();
+    }
+    return CodexRemoteWorkspaceBrowser(
+      key: key,
+      workspacePath: workspacePath,
+      remoteBridgeUrl: bridgeUrl,
+      enableSystemBackHandler: enableSystemBackHandler,
+      translucentSurfaces: translucentSurfaces,
+      showBreadcrumbHeader: true,
+      showHeaderTitle: false,
+      onCanGoUpChanged: (canGoUp) {
+        if (_workspaceBrowserCanGoUp == canGoUp || !mounted) return;
+        setState(() {
+          _workspaceBrowserCanGoUp = canGoUp;
+        });
+      },
+    );
+  }
+
+  Widget _buildRemoteCodexWorkspaceUnavailable() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_workspaceBrowserCanGoUp) return;
+      setState(() {
+        _workspaceBrowserCanGoUp = false;
+      });
+    });
+    final palette = context.omniPalette;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(28),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.folder_off_outlined,
+              size: 34,
+              color: palette.textSecondary,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              LegacyTextLocalizer.isEnglish
+                  ? 'Remote Codex workspace is not configured'
+                  : '远程 Codex 工作目录尚未配置',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: palette.textPrimary,
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              LegacyTextLocalizer.isEnglish
+                  ? 'Open Codex settings and set a remote cwd, or scan the PC Bridge QR code.'
+                  : '请在 Codex 配置中设置远程工作目录，或扫描 PC Bridge 二维码。',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: palette.textSecondary,
+                fontSize: 12,
+                height: 1.4,
+              ),
+            ),
+            const SizedBox(height: 14),
+            TextButton.icon(
+              onPressed: () => GoRouterManager.push('/home/codex_setting'),
+              icon: const Icon(Icons.settings_outlined, size: 18),
+              label: Text(LegacyTextLocalizer.localize('Codex 配置')),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1106,6 +1211,9 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
               onCodexTap: () {
                 unawaited(_handleCodexTap());
               },
+              onPrimaryModeTap: _activeMode == ChatPageMode.codex
+                  ? () => GoRouterManager.push('/home/codex_sessions')
+                  : null,
               onCompanionTap: () {
                 unawaited(_toggleCompanionMode());
               },
@@ -1217,6 +1325,40 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
                       onLongPressContextUsageRing:
                           _activeMode == ChatPageMode.normal
                           ? _handleContextUsageRingLongPress
+                          : null,
+                      codexRunSettings: _activeMode == ChatPageMode.codex
+                          ? CodexRunSettings(
+                              modelId: _activeCodexModelId ?? '',
+                              reasoningEffort:
+                                  _activeCodexReasoningEffort ?? 'xhigh',
+                              modelOptions: _codexModelOptions,
+                              reasoningEffortOptions:
+                                  _codexReasoningEffortOptions,
+                              isLoadingModels: _isCodexModelListLoading,
+                              modelListError: _codexModelListError,
+                            )
+                          : null,
+                      onCodexRunSettingsOpened:
+                          _activeMode == ChatPageMode.codex
+                          ? () => _loadCodexModelOptions(force: true)
+                          : null,
+                      onCodexRunSettingsChanged:
+                          _activeMode == ChatPageMode.codex
+                          ? ({String? modelId, String? reasoningEffort}) {
+                              if (modelId != null) {
+                                unawaited(
+                                  _selectCodexModel(
+                                    modelId,
+                                    clearComposer: false,
+                                  ),
+                                );
+                              }
+                              if (reasoningEffort != null) {
+                                unawaited(
+                                  _selectCodexReasoningEffort(reasoningEffort),
+                                );
+                              }
+                            }
                           : null,
                       codexPermissionMode: _activeMode == ChatPageMode.codex
                           ? _codexPermissionMode
@@ -1332,6 +1474,13 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
     required bool backgroundActive,
     required AppBackgroundVisualProfile visualProfile,
   }) {
+    if (_shouldUseRemoteCodexWorkspace()) {
+      return _buildRemoteCodexWorkspaceBrowser(
+        key: _hdPadRemoteWorkspaceBrowserKey,
+        translucentSurfaces: backgroundActive,
+        enableSystemBackHandler: false,
+      );
+    }
     final workspacePathsFuture = _workspacePathsLoadFuture ??=
         OmnibotResourceService.ensureWorkspacePathsLoaded();
     return FutureBuilder<OmnibotWorkspacePaths>(
@@ -1660,7 +1809,13 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
                 if (isHdPadLandscape &&
                     !_hdPadRightPaneCollapsed &&
                     _workspaceBrowserCanGoUp) {
-                  _hdPadWorkspaceBrowserKey.currentState?.openParentDirectory();
+                  if (_shouldUseRemoteCodexWorkspace()) {
+                    _hdPadRemoteWorkspaceBrowserKey.currentState
+                        ?.openParentDirectory();
+                  } else {
+                    _hdPadWorkspaceBrowserKey.currentState
+                        ?.openParentDirectory();
+                  }
                   return;
                 }
                 if (_isWorkspaceSurface && _workspaceBrowserCanGoUp) {
@@ -1870,7 +2025,8 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
             return success;
           }
 
-          final modelId = _activeConversationModelOverrideSelection?.modelId ??
+          final modelId =
+              _activeConversationModelOverrideSelection?.modelId ??
               _activeDispatchSceneSelection?.modelId;
           if (modelId != null && modelId.isNotEmpty) {
             await StorageService.setManualModelContextThreshold(
@@ -1955,33 +2111,21 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
     required bool showEditAction,
     required bool showRetryAction,
   }) {
-    final actionCount =
-        1 + (showEditAction ? 1 : 0) + (showRetryAction ? 1 : 0);
-    final estimatedMenuHeight = 4 + actionCount * 48.0 + (actionCount - 1);
-    final position = PopupMenuAnchorPosition.fromGlobalOffset(
+    final anchor = glassPopupAnchorFromGlobalPosition(context, globalPosition);
+    if (anchor == null) {
+      return Future<_UserMessageQuickAction?>.value();
+    }
+    return showGlassPopup<_UserMessageQuickAction>(
       context: context,
-      globalOffset: globalPosition,
-      estimatedMenuHeight: estimatedMenuHeight,
+      anchor: anchor,
       verticalGap: 10,
-      reservedBottom: MediaQuery.of(context).viewInsets.bottom,
-    );
-    return showMenu<_UserMessageQuickAction>(
-      context: context,
-      position: position,
-      color: Colors.transparent,
-      shadowColor: Colors.transparent,
-      surfaceTintColor: Colors.transparent,
-      elevation: 0,
-      menuPadding: EdgeInsets.zero,
-      constraints: const BoxConstraints(minWidth: 188, maxWidth: 188),
-      items: [
-        _UserMessageQuickMenuEntry(
-          width: 188,
-          estimatedHeight: estimatedMenuHeight,
-          showEditAction: showEditAction,
-          showRetryAction: showRetryAction,
-        ),
-      ],
+      instant: true,
+      horizontalPlacement: GlassPopupHorizontalPlacement.centerOnAnchor,
+      child: _UserMessageQuickMenuContent(
+        width: 188,
+        showEditAction: showEditAction,
+        showRetryAction: showRetryAction,
+      ),
     );
   }
 
@@ -2088,6 +2232,9 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
 
     final conversationId = _currentConversationId;
     if (conversationId == null) return;
+    if (isEphemeralConversation(conversationId, activeConversationModeValue)) {
+      return;
+    }
 
     await ConversationHistoryService.saveConversationMessages(
       conversationId,
@@ -2149,6 +2296,69 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
     if (!mounted) return;
   }
 
+  Future<void> _retryFailedAgentTurn(ChatMessageModel message) async {
+    final taskId = _resolveRetryableAgentTaskId(message);
+    if (taskId == null) {
+      showToast(
+        LegacyTextLocalizer.isEnglish
+            ? 'This reply can no longer be retried'
+            : '这条回复当前无法继续重试',
+        type: ToastType.warning,
+      );
+      return;
+    }
+    if (_pendingManualAgentRetryTaskIds.contains(taskId) ||
+        message.content?['agentRetrying'] == true) {
+      return;
+    }
+    if (_isAiResponding) {
+      showToast(
+        LegacyTextLocalizer.isEnglish
+            ? 'Wait for the current response to finish first'
+            : '请先等待当前回复结束',
+        type: ToastType.warning,
+      );
+      return;
+    }
+
+    final messageIndex = _messages.indexWhere((item) => item.id == message.id);
+    final previousMessage = messageIndex == -1 ? null : _messages[messageIndex];
+    _pendingManualAgentRetryTaskIds.add(taskId);
+    if (previousMessage != null && mounted) {
+      setState(() {
+        _messages[messageIndex] = _buildPendingManualRetryMessage(
+          previousMessage,
+          taskId: taskId,
+        );
+      });
+    }
+
+    final success = await AssistsMessageService.retryAgentTask(taskId: taskId);
+    _pendingManualAgentRetryTaskIds.remove(taskId);
+    if (!mounted) {
+      return;
+    }
+    if (!success) {
+      if (previousMessage != null) {
+        final restoreIndex = _messages.indexWhere(
+          (item) => item.id == previousMessage.id,
+        );
+        if (restoreIndex != -1) {
+          setState(() {
+            _messages[restoreIndex] = previousMessage;
+          });
+        }
+      }
+      showToast(
+        LegacyTextLocalizer.isEnglish
+            ? 'Retry failed. Please try sending the message again.'
+            : '重试失败，请重新发送消息',
+        type: ToastType.error,
+      );
+      return;
+    }
+  }
+
   List<Map<String, dynamic>> _extractRetryAttachments(
     ChatMessageModel message,
   ) {
@@ -2160,6 +2370,42 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
         .toList();
   }
 
+  String? _resolveRetryableAgentTaskId(ChatMessageModel message) {
+    final contentTaskId = (message.content?['agentTaskId'] ?? '')
+        .toString()
+        .trim();
+    if (contentTaskId.isNotEmpty) {
+      return contentTaskId;
+    }
+    final streamTaskId = (message.streamMeta?['parentTaskId'] ?? '')
+        .toString()
+        .trim();
+    if (streamTaskId.isNotEmpty) {
+      return streamTaskId;
+    }
+    return null;
+  }
+
+  ChatMessageModel _buildPendingManualRetryMessage(
+    ChatMessageModel message, {
+    required String taskId,
+  }) {
+    final content = Map<String, dynamic>.from(message.content ?? const {});
+    content['agentTaskId'] = taskId;
+    content['agentRetrying'] = true;
+    content['agentRetryStatusText'] = LegacyTextLocalizer.isEnglish
+        ? 'Retrying connection...'
+        : '连接中断，正在重试…';
+    content['agentRetryCount'] = 0;
+    content['agentMaxRetries'] =
+        (content['agentMaxRetries'] as num?)?.toInt() ?? 3;
+    content['agentRetryDelayMs'] = 0;
+    content.remove('agentRetryReason');
+    content.remove('agentRetryable');
+    content.remove('agentErrorText');
+    return message.copyWith(content: content, isError: false);
+  }
+
   String _formatTokenCount(int value) {
     return value.toString().replaceAllMapped(
       RegExp(r'\B(?=(\d{3})+(?!\d))'),
@@ -2168,42 +2414,32 @@ mixin _ChatPageUiMixin on _ChatPageStateBase {
   }
 }
 
-class _UserMessageQuickMenuEntry
-    extends PopupMenuEntry<_UserMessageQuickAction> {
-  const _UserMessageQuickMenuEntry({
+class _UserMessageQuickMenuContent extends StatelessWidget {
+  const _UserMessageQuickMenuContent({
     required this.width,
-    required this.estimatedHeight,
     required this.showEditAction,
     required this.showRetryAction,
   });
 
   final double width;
-  final double estimatedHeight;
   final bool showEditAction;
   final bool showRetryAction;
 
-  @override
-  double get height => estimatedHeight;
-
-  @override
-  bool represents(_UserMessageQuickAction? value) => false;
-
-  @override
-  State<_UserMessageQuickMenuEntry> createState() =>
-      _UserMessageQuickMenuEntryState();
-}
-
-class _UserMessageQuickMenuEntryState
-    extends State<_UserMessageQuickMenuEntry> {
-  void _select(_UserMessageQuickAction action) {
+  void _select(BuildContext context, _UserMessageQuickAction action) {
     Navigator.of(context).pop(action);
   }
 
-  Widget _buildAction({
+  Widget _buildAction(
+    BuildContext context, {
     required IconData icon,
     required String label,
     required VoidCallback onTap,
   }) {
+    final palette = context.omniPalette;
+    final isDark = context.isDarkTheme;
+    final foregroundColor = isDark
+        ? palette.textPrimary
+        : const Color(0xFF172033);
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(16),
@@ -2211,15 +2447,14 @@ class _UserMessageQuickMenuEntryState
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
         child: Row(
           children: [
-            Icon(icon, size: 18, color: Colors.black),
+            Icon(icon, size: 18, color: foregroundColor),
             const SizedBox(width: 10),
             Text(
               label,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 14,
-                color: Colors.black,
+                color: foregroundColor,
                 fontWeight: FontWeight.w600,
-                letterSpacing: 0.2,
               ),
             ),
           ],
@@ -2230,54 +2465,41 @@ class _UserMessageQuickMenuEntryState
 
   @override
   Widget build(BuildContext context) {
+    final palette = context.omniPalette;
+    final dividerColor = context.isDarkTheme
+        ? palette.borderSubtle.withValues(alpha: 0.58)
+        : Colors.white.withValues(alpha: 0.62);
     return SizedBox(
-      width: widget.width,
-      child: Material(
-        color: Colors.transparent,
-        child: Container(
-          margin: const EdgeInsets.all(4),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(18),
-            border: Border.all(color: const Color(0x14000000), width: 1),
-            boxShadow: const [
-              BoxShadow(
-                color: Color(0x26000000),
-                blurRadius: 18,
-                offset: Offset(0, 10),
-              ),
-            ],
-          ),
+      width: width,
+      child: OmniGlassPanel(
+        borderRadius: BorderRadius.circular(18),
+        child: Material(
+          color: Colors.transparent,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               _buildAction(
+                context,
                 icon: Icons.content_copy_rounded,
                 label: LegacyTextLocalizer.isEnglish ? 'Copy' : '复制',
-                onTap: () => _select(_UserMessageQuickAction.copy),
+                onTap: () => _select(context, _UserMessageQuickAction.copy),
               ),
-              if (widget.showEditAction) ...[
-                const Divider(
-                  height: 1,
-                  thickness: 1,
-                  color: Color(0x14000000),
-                ),
+              if (showEditAction) ...[
+                Divider(height: 1, thickness: 1, color: dividerColor),
                 _buildAction(
+                  context,
                   icon: Icons.edit_outlined,
                   label: LegacyTextLocalizer.isEnglish ? 'Edit' : '编辑',
-                  onTap: () => _select(_UserMessageQuickAction.edit),
+                  onTap: () => _select(context, _UserMessageQuickAction.edit),
                 ),
               ],
-              if (widget.showRetryAction) ...[
-                const Divider(
-                  height: 1,
-                  thickness: 1,
-                  color: Color(0x14000000),
-                ),
+              if (showRetryAction) ...[
+                Divider(height: 1, thickness: 1, color: dividerColor),
                 _buildAction(
+                  context,
                   icon: Icons.refresh_rounded,
                   label: LegacyTextLocalizer.isEnglish ? 'Retry' : '重试这条消息',
-                  onTap: () => _select(_UserMessageQuickAction.retry),
+                  onTap: () => _select(context, _UserMessageQuickAction.retry),
                 ),
               ],
             ],

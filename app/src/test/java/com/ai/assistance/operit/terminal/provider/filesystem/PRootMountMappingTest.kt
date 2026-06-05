@@ -46,9 +46,27 @@ class PRootMountMappingTest {
         val rootfsRoot = File("/tmp/alpine-rootfs")
 
         assertEquals(
-            "/tmp/alpine-rootfs/usr/local/bin/node",
+            File(rootfsRoot, "usr/local/bin/node").absolutePath,
             PRootMountMapping.mapLinuxPathToHostPath(
                 linuxPath = "/usr/local/bin/node",
+                rootfsRoot = rootfsRoot,
+                homeDir = "/home/root",
+                workspaceDir = "/workspace-host",
+                appDataDir = "/data/user/0/cn.com.omnimind.bot",
+                packageName = "cn.com.omnimind.bot",
+                chrootEnabled = false
+            )
+        )
+    }
+
+    @Test
+    fun mapLinuxPathToHostPath_mapsMtStorageMounts() {
+        val rootfsRoot = File("/tmp/alpine-rootfs")
+
+        assertEquals(
+            "/sdcard/notes/a.txt",
+            PRootMountMapping.mapLinuxPathToHostPath(
+                linuxPath = "/mnt/mt/notes/a.txt",
                 rootfsRoot = rootfsRoot,
                 homeDir = "/home/root",
                 workspaceDir = "/workspace-host",

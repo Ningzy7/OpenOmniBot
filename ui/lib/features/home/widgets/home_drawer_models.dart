@@ -18,10 +18,27 @@ class _DrawerShortcutAction {
 }
 
 class _ConversationSection {
-  _ConversationSection({required this.label, required this.results});
+  _ConversationSection({
+    required this.label,
+    required this.sectionKey,
+    required this.results,
+  });
 
   final String label;
+  final String sectionKey;
   final List<_ConversationSearchResult> results;
+}
+
+class _ScheduledConversationGroup {
+  const _ScheduledConversationGroup({
+    required this.parent,
+    required this.children,
+    required this.taskCount,
+  });
+
+  final ConversationModel parent;
+  final List<_ConversationSearchResult> children;
+  final int taskCount;
 }
 
 class _ConversationSearchIndex {

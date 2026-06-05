@@ -78,7 +78,7 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
       _activeSurfaceMode = ChatSurfaceMode.normal;
       _setChatIslandDisplayLayerForMode(
         ChatPageMode.normal,
-        ChatIslandDisplayLayer.model,
+        ChatIslandDisplayLayer.tools,
       );
     }
     final route = ModalRoute.of(context);
@@ -139,6 +139,12 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
     );
     if (normalizedIncomingTarget != null) {
       return normalizedIncomingTarget;
+    }
+
+    if (normalizedPreferredMode == null &&
+        StorageService.getChatStartupBehavior() ==
+            ChatStartupBehavior.newConversation) {
+      return _newThreadTargetForConversationMode(ConversationMode.normal);
     }
 
     if (normalizedPreferredMode == null) {
@@ -269,7 +275,11 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
     _resetLocalConversationState(targetMode);
     _vlmAnswerController.clear();
     _applyDraftForConversationMode(targetMode);
-    await initializeConversation(lifecycleToken: lifecycleToken);
+    if (effectiveTarget.isRemoteCodexSessionTarget) {
+      await _prepareRemoteCodexSessionTarget(effectiveTarget);
+    } else {
+      await initializeConversation(lifecycleToken: lifecycleToken);
+    }
     if (isStaleRequest()) return;
     if (_activeConversationMode == ChatPageMode.codex) {
       await _refreshCodexCommandPreferences();
@@ -278,6 +288,7 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
     await _applyStagedSharedDraftIfNeeded(effectiveTarget);
     if (isStaleRequest()) return;
     await _persistVisibleThreadTargetIfNeeded();
+    unawaited(_syncVisibleChatConversation());
     if (isStaleRequest()) return;
     if (syncPage) {
       _jumpToCurrentModePage(animate: false);
@@ -392,6 +403,11 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
       return;
     }
     _resolvedThreadTarget = visibleTarget;
+    if (visibleTarget.isRemoteCodexSessionTarget ||
+        (_activeConversationMode == ChatPageMode.codex &&
+            _isRemoteCodexRuntimeActiveForMode(ChatPageMode.codex))) {
+      return;
+    }
     await ConversationHistoryService.saveLastVisibleThreadTarget(visibleTarget);
     await ConversationHistoryService.saveCurrentConversationTarget(
       visibleTarget,
@@ -456,20 +472,30 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
       final deviceInfo = await DeviceService.getDeviceInfo();
       if (!mounted) return;
       final brand = (deviceInfo?['brand'] as String?)?.toLowerCase() ?? 'other';
-      final checkedSpecs = PermissionRegistry.getPermissionsByLevel(
+      final companionSpecs = PermissionRegistry.getPermissionsByLevel(
         brand: brand,
-        level: PermissionLevel.fullExecution,
+        level: PermissionLevel.companionAutomation,
       );
+      final accessibilitySpecs = PermissionRegistry.getPermissions(
+        brand: brand,
+      ).where((spec) => spec.id == kAccessibilityPermissionId);
+      final checkedSpecs = <PermissionSpec>[
+        ...companionSpecs,
+        ...accessibilitySpecs.where(
+          (spec) => companionSpecs.every((item) => item.id != spec.id),
+        ),
+      ];
       final permissionDataList = PermissionService.specsToPermissionData(
         checkedSpecs,
         context: context,
       );
       await PermissionService.checkPermissions(permissionDataList);
-      final allAuthorized = PermissionService.checkAllAuthorized(
+      final canStartCompanion = PermissionService.checkAuthorizedByIds(
         permissionDataList,
+        const {kOverlayPermissionId},
       );
 
-      if (!allAuthorized) {
+      if (!canStartCompanion) {
         if (!mounted) return;
         setState(() {
           _isCompanionToggleLoading = false;
@@ -478,6 +504,7 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
           context,
           initialPermissions: permissionDataList,
           deviceBrand: brand,
+          requiredPermissionIds: const {kOverlayPermissionId},
           onAllAuthorized: () {
             unawaited(_executeCompanionStart());
           },
@@ -486,6 +513,23 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
       }
 
       await _executeCompanionStart();
+      if (!mounted || !_isCompanionModeEnabled) {
+        return;
+      }
+      final accessibilityAuthorized = PermissionService.checkAuthorizedByIds(
+        permissionDataList,
+        const {kAccessibilityPermissionId},
+      );
+      if (!accessibilityAuthorized && mounted) {
+        await PermissionBottomSheet.show(
+          context,
+          initialPermissions: permissionDataList,
+          deviceBrand: brand,
+          buttonText: LegacyTextLocalizer.isEnglish ? 'Got it' : '我知道了',
+          requiredPermissionIds: const {kOverlayPermissionId},
+          onAllAuthorized: () {},
+        );
+      }
     } catch (e) {
       debugPrint('开启陪伴前置检查失败: $e');
       if (!mounted) return;
@@ -553,6 +597,7 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
 
   @override
   void dispose() {
+    unawaited(_clearVisibleChatConversation());
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_runtimeCoordinator.flushAllPendingPersistence());
     _cancelNormalSurfaceModelReveal();
@@ -584,6 +629,7 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
     _openClawBaseUrlController.dispose();
     _openClawTokenController.dispose();
     _openClawUserIdController.dispose();
+    _stopRemoteCodexSessionSync();
     _codexEventSubscription?.cancel();
     super.dispose();
   }
@@ -591,17 +637,23 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
   @override
   void didPopNext() {
     unawaited(_handleDidPopNext());
+    unawaited(_syncVisibleChatConversation());
   }
 
   @override
-  void didPush() {}
+  void didPush() {
+    unawaited(_syncVisibleChatConversation());
+  }
 
   @override
-  void didPop() {}
+  void didPop() {
+    unawaited(_clearVisibleChatConversation());
+  }
 
   @override
   void didPushNext() {
     _dismissChatInputFocus();
+    unawaited(_clearVisibleChatConversation());
   }
 
   Future<void> _handleDidPopNext() async {
@@ -639,6 +691,7 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
       return;
     }
     setState(() {});
+    unawaited(_syncVisibleChatConversation());
   }
 
   Future<void> _handleExternalConversationMessagesChanged(
@@ -669,6 +722,7 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
       return;
     }
     setState(() {});
+    unawaited(_syncVisibleChatConversation());
   }
 
   @override
@@ -797,7 +851,7 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
         _messageController.clear();
         _setChatIslandDisplayLayerForMode(
           ChatPageMode.normal,
-          ChatIslandDisplayLayer.mode,
+          ChatIslandDisplayLayer.tools,
         );
         _isBrowserOverlayVisible = false;
       });
@@ -817,11 +871,14 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
       _resetNormalSurfaceModelRevealInterruption();
       _setChatIslandDisplayLayerForMode(
         targetConversationMode,
-        ChatIslandDisplayLayer.mode,
+        targetConversationMode == ChatPageMode.normal
+            ? ChatIslandDisplayLayer.tools
+            : ChatIslandDisplayLayer.mode,
       );
     });
     _applyDraftForConversationMode(targetConversationMode);
     await _persistVisibleThreadTargetIfNeeded();
+    unawaited(_syncVisibleChatConversation());
     if (isStaleRequest()) return;
     _hideSlashCommandPanel();
     if (targetConversationMode == ChatPageMode.normal) {
@@ -948,6 +1005,7 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
       });
     }
     if (state == AppLifecycleState.resumed) {
+      unawaited(_syncVisibleChatConversation());
       _notifySummarySheetReadyIfNeeded();
       unawaited(_checkCompanionTaskState());
       unawaited(AppUpdateService.refreshIfNeeded());
@@ -957,8 +1015,33 @@ mixin _ChatPageLifecycleMixin on _ChatPageStateBase {
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
+      unawaited(_clearVisibleChatConversation());
       unawaited(_runtimeCoordinator.flushAllPendingPersistence());
       unawaited(_persistVisibleThreadTargetIfNeeded());
     }
+  }
+
+  Future<void> _syncVisibleChatConversation() async {
+    if (!mounted) return;
+    final route = ModalRoute.of(context);
+    if (route is PageRoute && !route.isCurrent) {
+      await _clearVisibleChatConversation();
+      return;
+    }
+    final target = _visibleThreadTarget;
+    if (target == null || target.isNewConversation) {
+      await AssistsMessageService.setVisibleChatConversation(
+        conversationMode: activeConversationModeValue.storageValue,
+      );
+      return;
+    }
+    await AssistsMessageService.setVisibleChatConversation(
+      conversationId: target.conversationId,
+      conversationMode: target.mode.storageValue,
+    );
+  }
+
+  Future<void> _clearVisibleChatConversation() {
+    return AssistsMessageService.setVisibleChatConversation(visible: false);
   }
 }

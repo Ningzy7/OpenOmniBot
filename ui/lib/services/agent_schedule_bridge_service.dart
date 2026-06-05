@@ -23,6 +23,13 @@ class AgentScheduleBridgeService {
       suggestionId: (raw['suggestionId'] ?? '').toString(),
       targetKind: targetKind,
       subagentConversationId: raw['subagentConversationId']?.toString(),
+      parentConversationId:
+          (raw['parentConversationId'] ?? raw['subagentParentConversationId'])
+              ?.toString(),
+      parentConversationMode:
+          (raw['parentConversationMode'] ??
+                  raw['subagentParentConversationMode'])
+              ?.toString(),
       subagentPrompt: raw['subagentPrompt']?.toString(),
       notificationEnabled: raw['notificationEnabled'] != false,
       type: type,
@@ -48,9 +55,11 @@ class AgentScheduleBridgeService {
       normalizedTask,
     );
     if (!saved) {
-      throw StateError(LegacyTextLocalizer.isEnglish
-          ? 'Failed to save scheduled task'
-          : '定时任务保存失败');
+      throw StateError(
+        LegacyTextLocalizer.isEnglish
+            ? 'Failed to save scheduled task'
+            : '定时任务保存失败',
+      );
     }
     if (normalizedTask.isEnabled) {
       ScheduledTaskSchedulerService.scheduleTask(normalizedTask);
@@ -85,9 +94,11 @@ class AgentScheduleBridgeService {
       taskId,
     );
     if (existing == null) {
-      throw StateError(LegacyTextLocalizer.isEnglish
-          ? 'Scheduled task not found'
-          : '未找到对应的定时任务');
+      throw StateError(
+        LegacyTextLocalizer.isEnglish
+            ? 'Scheduled task not found'
+            : '未找到对应的定时任务',
+      );
     }
 
     var nextType = existing.type;
@@ -103,6 +114,12 @@ class AgentScheduleBridgeService {
       subagentConversationId: raw.containsKey('subagentConversationId')
           ? raw['subagentConversationId']?.toString()
           : existing.subagentConversationId,
+      parentConversationId: raw.containsKey('parentConversationId')
+          ? raw['parentConversationId']?.toString()
+          : existing.parentConversationId,
+      parentConversationMode: raw.containsKey('parentConversationMode')
+          ? raw['parentConversationMode']?.toString()
+          : existing.parentConversationMode,
       subagentPrompt: raw.containsKey('subagentPrompt')
           ? raw['subagentPrompt']?.toString()
           : existing.subagentPrompt,
@@ -128,23 +145,20 @@ class AgentScheduleBridgeService {
           : existing.isEnabled,
       nextExecutionTime: null,
     );
-    final updatedSuggestionData = raw.containsKey('goal') ||
+    final updatedSuggestionData =
+        raw.containsKey('goal') ||
             raw.containsKey('subagentPrompt') ||
             raw.containsKey('targetKind')
-        ? _buildSuggestionData(
-            {
-              ...raw,
-              'targetKind': baseUpdated.targetKind,
-              'goal':
-                  raw['goal'] ?? existing.suggestionData?['goal'] ?? '',
-              'subagentPrompt':
-                  raw['subagentPrompt'] ??
-                  existing.subagentPrompt ??
-                  existing.suggestionData?['subagentPrompt'] ??
-                  '',
-            },
-            baseUpdated.targetKind,
-          )
+        ? _buildSuggestionData({
+            ...raw,
+            'targetKind': baseUpdated.targetKind,
+            'goal': raw['goal'] ?? existing.suggestionData?['goal'] ?? '',
+            'subagentPrompt':
+                raw['subagentPrompt'] ??
+                existing.subagentPrompt ??
+                existing.suggestionData?['subagentPrompt'] ??
+                '',
+          }, baseUpdated.targetKind)
         : existing.suggestionData;
     final updated = baseUpdated.copyWith(
       nextExecutionTime: baseUpdated.calculateNextExecutionTime(),
@@ -155,9 +169,11 @@ class AgentScheduleBridgeService {
       updated,
     );
     if (!saved) {
-      throw StateError(LegacyTextLocalizer.isEnglish
-          ? 'Failed to update scheduled task'
-          : '定时任务更新失败');
+      throw StateError(
+        LegacyTextLocalizer.isEnglish
+            ? 'Failed to update scheduled task'
+            : '定时任务更新失败',
+      );
     }
     if (updated.isEnabled) {
       ScheduledTaskSchedulerService.scheduleTask(updated);
@@ -182,9 +198,11 @@ class AgentScheduleBridgeService {
       taskId,
     );
     if (existing == null) {
-      throw StateError(LegacyTextLocalizer.isEnglish
-          ? 'Scheduled task not found'
-          : '未找到对应的定时任务');
+      throw StateError(
+        LegacyTextLocalizer.isEnglish
+            ? 'Scheduled task not found'
+            : '未找到对应的定时任务',
+      );
     }
 
     ScheduledTaskSchedulerService.cancelTask(taskId);
@@ -192,9 +210,11 @@ class AgentScheduleBridgeService {
       taskId,
     );
     if (!deleted) {
-      throw StateError(LegacyTextLocalizer.isEnglish
-          ? 'Failed to delete scheduled task'
-          : '定时任务删除失败');
+      throw StateError(
+        LegacyTextLocalizer.isEnglish
+            ? 'Failed to delete scheduled task'
+            : '定时任务删除失败',
+      );
     }
     return {
       'success': true,
@@ -231,10 +251,7 @@ class AgentScheduleBridgeService {
       if (prompt == null || prompt.isEmpty) {
         throw ArgumentError('SubAgent 定时任务缺少 subagentPrompt');
       }
-      return {
-        'targetKind': 'subagent',
-        'subagentPrompt': prompt,
-      };
+      return {'targetKind': 'subagent', 'subagentPrompt': prompt};
     }
 
     final goal = raw['goal']?.toString();
@@ -265,6 +282,8 @@ class AgentScheduleBridgeService {
       'targetKind': task.targetKind,
       'packageName': task.packageName,
       'subagentConversationId': task.subagentConversationId,
+      'parentConversationId': task.parentConversationId,
+      'parentConversationMode': task.parentConversationMode,
       'subagentPrompt': task.subagentPrompt,
       'notificationEnabled': task.notificationEnabled,
     };

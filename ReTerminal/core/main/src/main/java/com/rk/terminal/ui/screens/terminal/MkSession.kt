@@ -3,7 +3,9 @@ package com.rk.terminal.ui.screens.terminal
 import android.content.Context
 import android.os.Environment
 import android.util.Log
+import com.rk.libcommons.OmnibotTerminalEnvironment
 import com.rk.libcommons.ShellArgv
+import com.rk.libcommons.ShellAssetWriter
 import com.rk.libcommons.TerminalCommand
 import com.rk.libcommons.alpineDir
 import com.rk.libcommons.alpineHomeDir
@@ -56,21 +58,11 @@ object MkSession {
             val workingDir = launchCommand?.workingDir ?: alpineHomeDir().path
 
             val initFile: File = localBinDir().child("init-host")
-            initFile.parentFile?.mkdirs()
-            initFile.createFileIfNot()
-            assets.open("init-host.sh").use { input ->
-                initFile.outputStream().use { output -> input.copyTo(output) }
-            }
-            initFile.setExecutable(true, false)
+            ShellAssetWriter.writeExecutableShellAsset(this, "init-host.sh", initFile)
 
 
             localBinDir().child("init").apply {
-                parentFile?.mkdirs()
-                createFileIfNot()
-                assets.open("init.sh").use { input ->
-                    outputStream().use { output -> input.copyTo(output) }
-                }
-                setExecutable(true, false)
+                ShellAssetWriter.writeExecutableShellAsset(this@with, "init.sh", this)
             }
 
 
@@ -104,10 +96,14 @@ object MkSession {
                 env.add("PROOT_LOADER=${applicationInfo.nativeLibraryDir}/libproot-loader.so")
             }
 
-            if (Settings.seccomp) {
-                env.add("SECCOMP=1")
-            }
-
+            OmnibotTerminalEnvironment.buildTerminalEnvironment(applicationContext)
+                .forEach { (key, value) ->
+                    val normalizedKey = key.trim()
+                    if (normalizedKey.isNotEmpty()) {
+                        env.removeAll { item -> item.substringBefore('=') == normalizedKey }
+                        env.add("$normalizedKey=$value")
+                    }
+                }
 
 
 
@@ -149,6 +145,14 @@ object MkSession {
                     }
                     env.add("$normalizedKey=$value")
                 }
+            }
+
+            env.removeAll { item ->
+                val key = item.substringBefore('=')
+                key == "PROOT_NO_SECCOMP" || key == "SECCOMP"
+            }
+            if (Settings.seccomp) {
+                env.add("SECCOMP=1")
             }
 
             val args: Array<String>

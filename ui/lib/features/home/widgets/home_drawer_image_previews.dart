@@ -31,6 +31,7 @@ extension _HomeDrawerImagePreviews on HomeDrawerState {
   }
 
   void _restoreDrawerSnapshotCache() {
+    _scheduledTasks = ScheduledTaskStorageService.loadScheduledTasksSync();
     if (!HomeDrawerState._hasConversationSnapshotCache) {
       _hydrateDrawerSnapshotFromStorage();
     }

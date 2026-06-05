@@ -560,7 +560,12 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.text('已思考'), findsOneWidget);
+    // Collapsed state is unified across all agent modes: the header reads
+    // "已处理" rather than the per-tool count summary, regardless of how
+    // many tool calls happened inside. The count summary only resurfaces
+    // when the user expands the run.
+    expect(find.text('已处理'), findsOneWidget);
+    expect(find.text('已运行 1 条命令'), findsNothing);
     expect(find.text('最终回答'), findsOneWidget);
     expect(
       find.byKey(const ValueKey('agent-run-avatar-task-1')),
@@ -583,6 +588,187 @@ void main() {
     expect(find.text('详细思考过程'), findsNothing);
     expect(find.byType(AgentAvatarCircle), findsOneWidget);
     expect(find.byType(AgentAvatarButton), findsNothing);
+  });
+
+  testWidgets(
+    'codex agent run shows codex avatar and "已处理" label when collapsed',
+    (tester) async {
+      final controller = ScrollController();
+      final messages = _buildCompletedCodexAgentRunMessages();
+
+      await tester.pumpWidget(
+        _buildLocalizedApp(
+          child: SizedBox(
+            width: 400,
+            height: 520,
+            child: ChatMessageList(
+              messages: messages,
+              scrollController: controller,
+              onBeforeTaskExecute: () async {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Collapsed: header reads "已处理 …" (possibly suffixed with an
+      // elapsed-time string), NEVER "已探索 N 次搜索 …".
+      expect(find.textContaining('已处理'), findsOneWidget);
+      expect(find.text('已探索 2 次搜索'), findsNothing);
+      // Codex group must surface the codex glyph instead of the default
+      // user-configurable agent avatar.
+      expect(
+        find.byKey(const ValueKey('agent-run-codex-avatar-task-1')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('agent-run-avatar-task-1')),
+        findsNothing,
+      );
+
+      // Expanded: header still says "已处理 …" — and any inner tool-group
+      // capsule (when consecutive tool cards group together) ALSO says
+      // "已处理" instead of the previous count summary. So we expect AT
+      // LEAST one widget with "已处理" (could be the outer header alone,
+      // or outer + inner capsule depending on the messages).
+      await tester.tap(find.byKey(const ValueKey('agent-run-summary-task-1')));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('已处理'), findsWidgets);
+      expect(find.textContaining('已探索'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'agent run summary chevron stays glued to the right edge regardless of '
+    'label length',
+    (tester) async {
+      final controller = ScrollController();
+      final messages = _buildCompletedAgentRunMessages();
+
+      await tester.pumpWidget(
+        _buildLocalizedApp(
+          child: SizedBox(
+            width: 400,
+            height: 520,
+            child: ChatMessageList(
+              messages: messages,
+              scrollController: controller,
+              onBeforeTaskExecute: () async {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Regression for the "横线长度有问题" bug: the horizontal divider
+      // must extend almost to the chevron — before the fix
+      // Flexible(Text)+Expanded(line) split the remaining row 50/50, so
+      // the line stopped near the middle of the row. We assert this
+      // structurally by sampling the Expanded(Container(height:1)) widget
+      // that draws the line and verifying it stretches across the bulk of
+      // the row.
+      final summaryToggle = find.byKey(
+        const ValueKey('agent-run-summary-task-1'),
+      );
+      expect(summaryToggle, findsOneWidget);
+      final toggleRect = tester.getRect(summaryToggle);
+      final rowFinder = find.descendant(
+        of: summaryToggle,
+        matching: find.byType(Row),
+      );
+      expect(rowFinder, findsOneWidget);
+      final rowRect = tester.getRect(rowFinder);
+      // The Container(height:1) wrapped by Expanded is the divider line.
+      final dividerFinder = find.descendant(
+        of: rowFinder,
+        matching: find.byWidgetPredicate((widget) {
+          if (widget is! Container) return false;
+          final constraints = widget.constraints;
+          return constraints != null && constraints.maxHeight == 1.0;
+        }),
+      );
+      expect(dividerFinder, findsOneWidget);
+      final dividerRect = tester.getRect(dividerFinder);
+      // The divider should fill at least 35% of the row width, regardless
+      // of how short the label text is (the 50/50 split bug capped this
+      // at ~50% minus padding; without the fix a short label like "已处理"
+      // would leave a huge blank between the label and the divider).
+      final minDividerWidth = rowRect.width * 0.35;
+      expect(
+        dividerRect.width,
+        greaterThan(minDividerWidth),
+        reason:
+            'divider width=${dividerRect.width} must take at least '
+            '${minDividerWidth.toStringAsFixed(1)} of row width '
+            '(${rowRect.width.toStringAsFixed(1)}).',
+      );
+      // And it must extend close to the right edge of the row so the
+      // chevron is glued to the right side. We allow up to chevron(18) +
+      // gap(6) + inner padding(2) + safety(10) ≈ 36px from the rightmost
+      // row pixel.
+      expect(
+        rowRect.right - dividerRect.right,
+        lessThan(40),
+        reason:
+            'divider right=${dividerRect.right} must be within 40px of row '
+            'right=${rowRect.right} (gap = chevron+spacer+padding).',
+      );
+      // Sanity: also confirm the entire summary fills the available list
+      // width (proves the row width itself is not being collapsed).
+      expect(
+        rowRect.width,
+        greaterThan(toggleRect.width * 0.8),
+        reason: 'row should fill most of the toggle width',
+      );
+    },
+  );
+
+  testWidgets('adjacent tool calls collapse into an expandable group', (
+    tester,
+  ) async {
+    final controller = ScrollController();
+    final messages = _buildCompletedAgentRunMessagesWithToolGroup();
+
+    await tester.pumpWidget(
+      _buildLocalizedApp(
+        child: SizedBox(
+          width: 400,
+          height: 520,
+          child: ChatMessageList(
+            messages: messages,
+            scrollController: controller,
+            onBeforeTaskExecute: () async {},
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('agent-run-summary-task-1')));
+    await tester.pumpAndSettle();
+
+    // The per-tool count summary is no longer surfaced anywhere — both the
+    // outer run header AND the inner tool-group capsule now read "已处理"
+    // (the user asked for the expanded UI to match the collapsed UI).
+    // There should be at least two "已处理" labels visible: the run header
+    // and the inner tool group capsule.
+    expect(find.text('已运行 1 条命令 · 已读取 1 个文件'), findsNothing);
+    expect(find.textContaining('已处理'), findsWidgets);
+
+    final toolGroupToggle = find.byKey(
+      const ValueKey(
+        'agent-tool-call-group-toggle-task-1-task-1-tool-1-task-1-tool-2',
+      ),
+    );
+    expect(toolGroupToggle, findsOneWidget);
+    expect(find.text('运行 git status'), findsNothing);
+    expect(find.text('读取 README.md'), findsNothing);
+
+    await tester.tap(toolGroupToggle);
+    await tester.pumpAndSettle();
+
+    expect(find.text('运行 git status'), findsOneWidget);
+    expect(find.text('读取 README.md'), findsOneWidget);
   });
 
   testWidgets('reopening run collapses thinking details by default again', (
@@ -1063,6 +1249,154 @@ List<ChatMessageModel> _buildCompletedAgentRunMessages({bool isFinal = true}) {
       <String, dynamic>{
         'type': 'deep_thinking',
         'thinkingContent': '详细思考过程',
+        'stage': 4,
+        'isLoading': false,
+        'taskID': 'task-1',
+        'cardId': 'task-1-thinking',
+      },
+      id: 'task-1-thinking',
+      streamMeta: const <String, dynamic>{
+        'parentTaskId': 'task-1',
+        'kind': 'thinking_snapshot',
+        'seq': 10,
+        'entryId': 'task-1-thinking',
+        'isFinal': false,
+      },
+    ),
+    ChatMessageModel.userMessage('用户问题', id: 'task-1-user'),
+  ];
+}
+
+List<ChatMessageModel> _buildCompletedAgentRunMessagesWithToolGroup() {
+  return <ChatMessageModel>[
+    ChatMessageModel(
+      id: 'task-1-text',
+      type: 1,
+      user: 2,
+      content: const <String, dynamic>{'text': '最终回答', 'id': 'task-1-text'},
+      streamMeta: const <String, dynamic>{
+        'parentTaskId': 'task-1',
+        'kind': 'text_snapshot',
+        'seq': 30,
+        'entryId': 'task-1-text',
+        'isFinal': true,
+      },
+    ),
+    ChatMessageModel.cardMessage(
+      <String, dynamic>{
+        'type': 'agent_tool_summary',
+        'status': 'success',
+        'toolType': 'workspace',
+        'toolTitle': '读取 README.md',
+        'summary': '读取完成',
+      },
+      id: 'task-1-tool-2',
+      streamMeta: const <String, dynamic>{
+        'parentTaskId': 'task-1',
+        'kind': 'tool_completed',
+        'seq': 25,
+        'entryId': 'task-1-tool-2',
+        'isFinal': false,
+      },
+    ),
+    ChatMessageModel.cardMessage(
+      <String, dynamic>{
+        'type': 'agent_tool_summary',
+        'status': 'success',
+        'toolType': 'terminal',
+        'toolTitle': '运行 git status',
+        'summary': '命令执行完成',
+        'terminalOutput': 'On branch main',
+      },
+      id: 'task-1-tool-1',
+      streamMeta: const <String, dynamic>{
+        'parentTaskId': 'task-1',
+        'kind': 'tool_completed',
+        'seq': 20,
+        'entryId': 'task-1-tool-1',
+        'isFinal': false,
+      },
+    ),
+    ChatMessageModel.cardMessage(
+      <String, dynamic>{
+        'type': 'deep_thinking',
+        'thinkingContent': '详细思考过程',
+        'stage': 4,
+        'isLoading': false,
+        'taskID': 'task-1',
+        'cardId': 'task-1-thinking',
+      },
+      id: 'task-1-thinking',
+      streamMeta: const <String, dynamic>{
+        'parentTaskId': 'task-1',
+        'kind': 'thinking_snapshot',
+        'seq': 10,
+        'entryId': 'task-1-thinking',
+        'isFinal': false,
+      },
+    ),
+    ChatMessageModel.userMessage('用户问题', id: 'task-1-user'),
+  ];
+}
+
+List<ChatMessageModel> _buildCompletedCodexAgentRunMessages() {
+  // Same shape as _buildCompletedAgentRunMessages but every tool card carries
+  // cardData.uiStyle = 'codex_tool', so the AgentRunGroup widget classifies
+  // the group as a codex run (collapsed → "已处理", avatar → codex SVG).
+  return <ChatMessageModel>[
+    ChatMessageModel(
+      id: 'task-1-text',
+      type: 1,
+      user: 2,
+      content: const <String, dynamic>{'text': '最终回答', 'id': 'task-1-text'},
+      streamMeta: const <String, dynamic>{
+        'parentTaskId': 'task-1',
+        'kind': 'text_snapshot',
+        'seq': 30,
+        'entryId': 'task-1-text',
+        'isFinal': true,
+      },
+    ),
+    ChatMessageModel.cardMessage(
+      <String, dynamic>{
+        'type': 'agent_tool_summary',
+        'uiStyle': 'codex_tool',
+        'status': 'success',
+        'toolType': 'search',
+        'toolTitle': 'rg foo',
+        'summary': 'rg 完成',
+      },
+      id: 'task-1-tool-search-1',
+      streamMeta: const <String, dynamic>{
+        'parentTaskId': 'task-1',
+        'kind': 'tool_completed',
+        'seq': 26,
+        'entryId': 'task-1-tool-search-1',
+        'isFinal': false,
+      },
+    ),
+    ChatMessageModel.cardMessage(
+      <String, dynamic>{
+        'type': 'agent_tool_summary',
+        'uiStyle': 'codex_tool',
+        'status': 'success',
+        'toolType': 'search',
+        'toolTitle': 'rg bar',
+        'summary': 'rg 完成',
+      },
+      id: 'task-1-tool-search-2',
+      streamMeta: const <String, dynamic>{
+        'parentTaskId': 'task-1',
+        'kind': 'tool_completed',
+        'seq': 25,
+        'entryId': 'task-1-tool-search-2',
+        'isFinal': false,
+      },
+    ),
+    ChatMessageModel.cardMessage(
+      <String, dynamic>{
+        'type': 'deep_thinking',
+        'thinkingContent': 'codex 在思考',
         'stage': 4,
         'isLoading': false,
         'taskID': 'task-1',

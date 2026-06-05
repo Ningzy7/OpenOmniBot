@@ -8,7 +8,9 @@ import 'package:flutter/material.dart';
 import 'package:ui/services/special_permission.dart';
 import 'package:ui/services/storage_service.dart';
 import 'package:ui/theme/theme_context.dart';
+import 'package:ui/widgets/glass_popup.dart';
 import 'package:ui/widgets/image_preview_overlay.dart';
+import 'package:ui/widgets/omni_glass.dart';
 import 'package:ui/widgets/text_input_context_menu.dart';
 
 part 'chat_input_area_composer.dart';
@@ -34,6 +36,27 @@ const String _kCodexPermissionFullAccessIconAsset =
     'assets/home/chat/permission_shield_alert.svg';
 
 enum CodexPermissionMode { defaultMode, autoReview, fullAccess }
+
+typedef CodexRunSettingsChanged =
+    FutureOr<void> Function({String? modelId, String? reasoningEffort});
+
+class CodexRunSettings {
+  const CodexRunSettings({
+    required this.modelId,
+    required this.reasoningEffort,
+    this.modelOptions = const <String>[],
+    this.reasoningEffortOptions = const <String>[],
+    this.isLoadingModels = false,
+    this.modelListError,
+  });
+
+  final String modelId;
+  final String reasoningEffort;
+  final List<String> modelOptions;
+  final List<String> reasoningEffortOptions;
+  final bool isLoadingModels;
+  final String? modelListError;
+}
 
 class ChatInputAttachment {
   final String id;
@@ -97,6 +120,9 @@ class ChatInputArea extends StatefulWidget {
   final double? contextUsageRatio;
   final String? contextUsageTooltipMessage;
   final VoidCallback? onLongPressContextUsageRing;
+  final CodexRunSettings? codexRunSettings;
+  final CodexRunSettingsChanged? onCodexRunSettingsChanged;
+  final FutureOr<void> Function()? onCodexRunSettingsOpened;
   final CodexPermissionMode? codexPermissionMode;
   final ValueChanged<CodexPermissionMode>? onCodexPermissionModeChanged;
   final bool useIndependentSendButton;
@@ -126,6 +152,9 @@ class ChatInputArea extends StatefulWidget {
     this.contextUsageRatio,
     this.contextUsageTooltipMessage,
     this.onLongPressContextUsageRing,
+    this.codexRunSettings,
+    this.onCodexRunSettingsChanged,
+    this.onCodexRunSettingsOpened,
     this.codexPermissionMode,
     this.onCodexPermissionModeChanged,
     this.useIndependentSendButton = true,
