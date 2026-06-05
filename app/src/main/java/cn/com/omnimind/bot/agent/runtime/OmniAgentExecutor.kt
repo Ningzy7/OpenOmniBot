@@ -331,14 +331,13 @@ class OmniAgentExecutor(
         attachments: List<Map<String, Any?>>
     ): cn.com.omnimind.baselib.llm.ChatCompletionMessage {
         // 不过滤 sendToModel：所有图片附件都需过 VLM 描述。
-        // 上游对用户上传的附件设 sendToModel=false（避免发 image_url 给多模态模型），
-        // 但主 Agent 是纯文本模型，必须用 VLM 描述替代。
-        val normalizedAttachments = normalizeAttachments(attachments)
+        // 直接用 AgentImageAttachmentSupport（支持 path→dataUrl→url 多级 fallback）。
         val vlmDescriptions = mutableListOf<String>()
 
-        // ★ 用户上传图片时先用 VLM 描述，避免纯文本模型 400
-        for (attachment in normalizedAttachments.filter { it.isImage }) {
-            val imageUrl = resolveImageAttachmentUrl(attachment)
+        for (attachment in attachments) {
+            val isImage = AgentImageAttachmentSupport.isImageAttachment(attachment)
+            if (!isImage) continue
+            val imageUrl = AgentImageAttachmentSupport.resolveImageAttachmentUrl(attachment)
             if (imageUrl.isBlank()) continue
             try {
                 val description = AgentImageAttachmentSupport.describeImageViaVlm(imageUrl)
@@ -363,56 +362,3 @@ class OmniAgentExecutor(
             content = content
         )
     }
-
-    private data class PromptAttachment(
-        val isImage: Boolean,
-        val url: String?,
-        val dataUrl: String?,
-        val path: String?,
-        val mimeType: String?
-    )
-
-    private fun normalizeAttachments(attachments: List<Map<String, Any?>>): List<PromptAttachment> {
-        return attachments.map { item ->
-            val mimeType = item["mimeType"]?.toString()?.trim()
-            val explicitImage = item["isImage"]?.toString()?.toBooleanStrictOrNull()
-            val isImage = explicitImage ?: mimeType.orEmpty().lowercase().startsWith("image/")
-            // 上游附件有 path(Android绝对路径) 和 workspacePath(proot路径) 两个字段。
-            // 在 Alpine proot 环境中只能访问 workspacePath，优先用它作为 VLM 图片读取路径。
-            val rawPath = item["workspacePath"]?.toString()?.trim()
-                ?.takeIf { it.isNotEmpty() }
-                ?: item["path"]?.toString()?.trim()
-            PromptAttachment(
-                isImage = isImage,
-                url = item["url"]?.toString(),
-                dataUrl = item["dataUrl"]?.toString(),
-                path = rawPath,
-                mimeType = mimeType
-            )
-        }
-    }
-
-    private fun resolveImageAttachmentUrl(attachment: PromptAttachment): String {
-        val dataUrl = attachment.dataUrl.orEmpty().trim()
-        if (dataUrl.startsWith("data:")) return dataUrl
-
-        val remoteUrl = attachment.url.orEmpty().trim()
-        if (remoteUrl.startsWith("https://") || remoteUrl.startsWith("http://") || remoteUrl.startsWith("data:")) {
-            return remoteUrl
-        }
-        val path = attachment.path.orEmpty().trim()
-        if (path.isNotEmpty()) {
-            val resolved = AgentImageAttachmentSupport.resolveImageAttachmentUrl(
-                mapOf(
-                    "path" to path,
-                    "mimeType" to attachment.mimeType,
-                    "isImage" to attachment.isImage
-                )
-            )
-            if (resolved.isNotBlank()) {
-                return resolved
-            }
-        }
-        return ""
-    }
-}
