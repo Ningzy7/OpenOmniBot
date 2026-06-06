@@ -342,7 +342,21 @@ class OmniAgentExecutor(
         for (attachment in attachments) {
             val isImage = AgentImageAttachmentSupport.isImageAttachment(attachment)
             if (!isImage) continue
-            val imageUrl = AgentImageAttachmentSupport.resolveImageAttachmentUrl(attachment)
+            val imageUrl = AgentImageAttachmentSupport.resolveImageAttachmentUrl(attachment).takeIf {
+                it.isNotBlank()
+            } ?: run {
+                    // Fallback: user-uploaded image stores local filesystem path in "url" key,
+                    // but resolveImageAttachmentUrl only reads "path" key for local files.
+                    val localUrl = attachment["url"]?.toString()?.trim().orEmpty()
+                    if (localUrl.isNotBlank() &&
+                        !localUrl.startsWith("http://") &&
+                        !localUrl.startsWith("https://")
+                    ) {
+                        AgentImageAttachmentSupport.resolveImageAttachmentUrl(
+                            attachment + mapOf("path" to localUrl)
+                        )
+                    } else ""
+                }
             if (imageUrl.isBlank()) continue
             try {
                 val description = AgentImageAttachmentSupport.describeImageViaVlm(imageUrl)
