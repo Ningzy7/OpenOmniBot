@@ -347,13 +347,19 @@ class OmniAgentExecutor(
             } ?: run {
                     // Fallback: user-uploaded image stores local filesystem path in "url" key,
                     // but resolveImageAttachmentUrl only reads "path" key for local files.
-                    val localUrl = attachment["url"]?.toString()?.trim().orEmpty()
-                    if (localUrl.isNotBlank() &&
-                        !localUrl.startsWith("http://") &&
-                        !localUrl.startsWith("https://")
+                    val rawUrl = attachment["url"]?.toString()?.trim().orEmpty()
+                    if (rawUrl.isNotBlank() &&
+                        !rawUrl.startsWith("http://") &&
+                        !rawUrl.startsWith("https://")
                     ) {
+                        // Convert omnibot://workspace/... to /workspace/... for File()
+                        val localPath = if (rawUrl.startsWith("omnibot://workspace/")) {
+                            "/workspace/" + rawUrl.removePrefix("omnibot://workspace/")
+                        } else {
+                            rawUrl
+                        }
                         AgentImageAttachmentSupport.resolveImageAttachmentUrl(
-                            attachment + mapOf("path" to localUrl)
+                            attachment + mapOf("path" to localPath)
                         )
                     } else ""
                 }
