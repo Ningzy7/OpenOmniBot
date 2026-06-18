@@ -1,0 +1,8 @@
+fix: 纯文本模型遇 image_url 熄火 - VLM 降级改为文本 fallback
+
+根因：appendToolResultMessage 中 describeImageViaVlm 失败时返回 null，
+触发降级为 {type: image_url} 数组，纯文本模型 API 报 400。
+
+修复：catch 块改为返回 '[截图描述失败: ...]' 文本 fallback，
+与 buildPromptContentFromMessagePayload 的历史图策略一致。
+VLM 成功与否，主 Agent 始终只收纯文本，彻底堵死 image_url 入口。

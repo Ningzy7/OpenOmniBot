@@ -606,13 +606,14 @@ class AgentOrchestrator(
         }
 
         // ★ 有截图时用 VLM (scene.vlm.operation.primary) 描述图片返回文本，避免纯文本模型 400
+        // ★ VLM 降级路径始终走文本 fallback，不送 image_url 给纯文本模型
         val finalText = if (imageDataUrl != null) {
             try {
                 val description = AgentImageAttachmentSupport.describeImageViaVlm(imageDataUrl)
                 "$textContent\n\n[VLM 图像描述]: $description"
             } catch (e: Exception) {
-                OmniLog.w(tag, "VLM 描述失败，退而发送 image_url: ${e.message}")
-                null
+                OmniLog.w(tag, "VLM 描述失败，使用文本 fallback: ${e.message}")
+                "$textContent\n\n[截图描述失败: ${e.message?.take(80) ?: "VLM 服务暂时不可用"}]"
             }
         } else null
 
